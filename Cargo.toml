@@ -5,14 +5,14 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-eframe = { version = "=0.33.3", default-features = false, features = ["default_fonts", "glow"] }
-egui-phosphor = "=0.11.0"
+eframe = { version = "=0.37.0", default-features = false, features = ["default_fonts", "glow", "accesskit", "clipboard", "links", "system_fonts"] }
 lumakit-ai = { path = "../LumaKit/crates/lumakit-ai" }
 lumakit-egui = { path = "../LumaKit/crates/lumakit-egui" }
 lumakit-support = { path = "../LumaKit/crates/lumakit-support" }
 lumakit-ui = { path = "../LumaKit/crates/lumakit-ui" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.40", features = ["bundled"] }
 tokio-util = "0.7"
 zeroize = "1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }

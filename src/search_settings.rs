@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::{path::{Path, PathBuf}, sync::mpsc, thread, time::Duration};
 use tokio_util::sync::CancellationToken;
 use zeroize::Zeroize;
+use crate::settings_store::{self, SearchConfigRow, SearchData, SearchKeyRow};
 
 const FILE: &str = "search-settings.json";
 const MAX_BODY: usize = 2 * 1024 * 1024;
@@ -36,6 +37,31 @@ struct Stored { default_search: Provider, default_fetch: Provider, configs: Vec<
 impl Default for Stored {
     fn default() -> Self { Self { default_search: Provider::Tavily, default_fetch: Provider::Jina, configs: PROVIDERS.iter().map(|&p| Config { provider: p, endpoint: p.endpoint().into(), keys: Vec::new() }).collect(), preferences: SearchPreferences::default(), compression: Compression::None } }
 }
+impl Stored {
+    fn from_database(data: SearchData) -> Result<Self, String> {
+        let provider = |name: String| serde_json::from_value(serde_json::Value::String(name)).map_err(|_| "搜索数据库包含未知服务商".to_owned());
+        let value = Self {
+            default_search: provider(data.default_search)?, default_fetch: provider(data.default_fetch)?,
+            configs: data.configs.into_iter().map(|config| Ok(Config { provider: provider(config.provider)?, endpoint: config.endpoint,
+                keys: config.keys.into_iter().map(|key| SavedKey { id: key.id, masked: key.masked, ciphertext: key.ciphertext }).collect() })).collect::<Result<_, String>>()?,
+            preferences: serde_json::from_value(data.preferences).map_err(|_| "搜索数据库偏好无效".to_owned())?,
+            compression: serde_json::from_value(serde_json::Value::String(data.compression)).map_err(|_| "搜索数据库压缩方式无效".to_owned())?,
+        };
+        validate_stored(&value)?;
+        Ok(value)
+    }
+    fn save(&self, root: &Path) -> Result<(), String> {
+        validate_stored(self)?;
+        let name = |provider: Provider| match provider { Provider::Tavily => "tavily", Provider::Brave => "brave", Provider::Exa => "exa", Provider::Direct => "direct", Provider::Jina => "jina" }.to_owned();
+        settings_store::save_search(root, &SearchData {
+            default_search: name(self.default_search), default_fetch: name(self.default_fetch),
+            configs: self.configs.iter().map(|config| SearchConfigRow { provider: name(config.provider), endpoint: config.endpoint.clone(),
+                keys: config.keys.iter().map(|key| SearchKeyRow { id: key.id.clone(), masked: key.masked.clone(), ciphertext: key.ciphertext.clone() }).collect() }).collect(),
+            preferences: serde_json::to_value(&self.preferences).map_err(|_| "搜索偏好序列化失败".to_owned())?,
+            compression: match self.compression { Compression::None => "none", Compression::Cutoff => "cutoff" }.into(),
+        })
+    }
+}
 struct Draft { endpoint: String, key: String, editing: Option<String>, edit_value: String, revealed: Option<(String, String)> }
 impl Draft {
     fn new(endpoint: &str) -> Self { Self { endpoint: endpoint.into(), key: String::new(), editing: None, edit_value: String::new(), revealed: None } }
@@ -55,12 +81,18 @@ pub struct SearchSettings {
 }
 impl SearchSettings {
     pub fn new(root: &Path) -> Result<Self, String> {
-        let stored = match lumakit_support::load_versioned::<Stored>(&root.join(FILE), 1).map_err(|_| "无法读取网络搜索设置；原文件未修改，请检查文件版本或权限".to_owned())? {
-            Some((1, value)) => value,
-            Some(_) => return Err("网络搜索设置版本不受支持；未覆盖原文件".into()),
-            None => Stored::default(),
+        let stored = match settings_store::load_search(root)? {
+            Some(data) => Stored::from_database(data)?,
+            None => {
+                let value = match lumakit_support::load_versioned::<Stored>(&root.join(FILE), 1).map_err(|_| "无法读取网络搜索设置；原文件未修改，请检查文件版本或权限".to_owned())? {
+                    Some((1, value)) => value,
+                    Some(_) => return Err("网络搜索设置版本不受支持；未覆盖原文件".into()),
+                    None => Stored::default(),
+                };
+                value.save(root)?;
+                value
+            }
         };
-        validate_stored(&stored)?;
         let drafts = stored.configs.iter().map(|c| Draft::new(&c.endpoint)).collect();
         let search_index = stored.configs.iter().position(|c| c.provider == stored.default_search).ok_or("缺少默认搜索配置")?;
         let fetch_index = stored.configs.iter().position(|c| c.provider == stored.default_fetch).ok_or("缺少默认读取配置")?;
@@ -95,7 +127,7 @@ impl SearchSettings {
             }
         }
         validate_stored(&next)?;
-        lumakit_support::save_versioned(&self.root.join(FILE), 1, &next).map_err(|_| "保存失败：请检查目录权限或磁盘空间；草稿和原凭据均已保留".to_owned())?;
+        next.save(&self.root).map_err(|error| format!("保存失败：{error}；草稿和原凭据均已保留"))?;
         self.preferences = next.preferences.clone(); self.blacklist = self.preferences.blacklist.join("\n"); self.stored = next;
         if clear_added { self.drafts[index].key.zeroize(); }
         Ok(())
@@ -350,6 +382,36 @@ fn decode_entities(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn sqlite_import_preserves_ciphertext_and_rolls_back_failed_save() {
+        let root = std::env::temp_dir().join(format!("lumadesk-search-import-{}", lumakit_support::new_id().unwrap()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join(FILE);
+        std::fs::write(&path, b"broken").unwrap();
+        assert!(SearchSettings::new(&root).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken");
+        let mut old = Stored::default();
+        old.configs[0].keys.push(SavedKey::new("migration-secret").unwrap());
+        lumakit_support::save_versioned(&path, 1, &old).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut settings = SearchSettings::new(&root).unwrap();
+        assert_eq!(settings.stored.configs[0].keys[0].ciphertext, old.configs[0].keys[0].ciphertext);
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(&path, b"not used after import").unwrap();
+        let connection = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+        connection.execute_batch("CREATE TRIGGER reject_search_write BEFORE INSERT ON search_configs BEGIN SELECT RAISE(ABORT,'reject'); END;").unwrap();
+        settings.drafts[0].endpoint = "https://changed.example".into();
+        assert!(settings.save(0, None).is_err());
+        let restored = SearchSettings::new(&root).unwrap();
+        assert_eq!(restored.stored.configs[0].endpoint, old.configs[0].endpoint);
+        assert_eq!(restored.stored.configs[0].keys[0].open().unwrap().as_str(), "migration-secret");
+        connection.execute_batch("DROP TRIGGER reject_search_write; DELETE FROM search_configs;").unwrap();
+        assert!(SearchSettings::new(&root).is_err());
+        drop(connection); drop(restored); drop(settings);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     use std::io::{Read, Write};
     #[test]
     fn invalid_blacklist_is_atomic_and_url_path_is_case_sensitive() {
@@ -379,7 +441,7 @@ mod tests {
         let mut settings = SearchSettings::new(&root).unwrap(); settings.drafts[0].endpoint = endpoint; settings.drafts[0].key = "local-test-key".into(); settings.save(0, None).unwrap();
         let restored = SearchSettings::new(&root).unwrap(); assert_eq!(restored.stored.configs[0].keys[0].open().unwrap().as_str(), "local-test-key"); assert!(restored.stored.configs[4].keys.is_empty());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(); let result = rt.block_on(search_query(restored.stored.configs[0].clone(), "本地查询".into(), restored.preferences.clone(), CancellationToken::new())).unwrap(); assert_eq!(result.hits[0].title, "真实回环"); worker.join().unwrap();
-        assert!(!std::fs::read_to_string(root.join(FILE)).unwrap().contains("local-test-key")); drop(restored); drop(settings); std::fs::remove_dir_all(root).unwrap();
+        assert!(!std::fs::read(root.join("settings.db")).unwrap().windows(b"local-test-key".len()).any(|bytes| bytes == b"local-test-key")); drop(restored); drop(settings); std::fs::remove_dir_all(root).unwrap();
     }
     #[cfg(windows)]
     #[test]

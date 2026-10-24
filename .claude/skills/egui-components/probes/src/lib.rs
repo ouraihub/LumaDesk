@@ -1,7 +1,7 @@
 #![cfg(test)]
 use egui::{Context, Event, Key, Modifiers, Pos2, RawInput, Rect, Response, Sense, Ui, Vec2};
 
-// 预研示例，不是已经存在于 lumakit-egui 的 API。
+// 交互验证样本，不是可直接接入项目的生产组件。
 pub fn switch(ui: &mut Ui, checked: &mut bool) -> Response {
     let (rect, mut response) = ui.allocate_exact_size(Vec2::new(40.0, 24.0), Sense::click());
     if response.clicked() { *checked = !*checked; response.mark_changed(); }

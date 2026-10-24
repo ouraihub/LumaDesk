@@ -9,7 +9,7 @@ if not exist "%MSVC_ROOT%\setup_x64.bat" (
   echo ERROR: MSVC toolchain not found: %MSVC_ROOT%\setup_x64.bat 1>&2
   exit /b 1
 )
-call "%MSVC_ROOT%\setup_x64.bat"
+call "%~dp0cargo-msvc.bat" --help >nul
 if errorlevel 1 exit /b 1
 echo [1/3] Checking runtime and application...
 call "%~dp0check.bat"

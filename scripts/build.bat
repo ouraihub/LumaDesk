@@ -11,7 +11,7 @@ if not exist "%MSVC_ROOT%\setup_x64.bat" (
 call "%MSVC_ROOT%\setup_x64.bat" >nul
 where /q cl.exe
 if errorlevel 1 exit /b 1
-call cargo +1.99.0 build --release
+call "%~dp0cargo-msvc.bat" build --release
 if errorlevel 1 exit /b 1
 echo Built: %CD%\target\release\luma-desk.exe
 echo Package with scripts\build-app.bat; output goes to dist\LumaDesk\ and dist\installer\.
