@@ -35,13 +35,14 @@ impl ChatState {
     pub fn ui(&mut self, ui: &mut egui::Ui, models: &ModelSettings) -> bool {
         let mut settings = false;
         let image_models = models.image_models();
-        let selected_model = if self.session.composer().image_mode { self.session.composer().image_model.as_ref() } else { self.session.history().model.as_ref() };
+        let selected_model = self.session.history().model.as_ref();
         let metadata = selected_model.and_then(|model| models.model_settings(model));
         let actions = ui.add_enabled_ui(self.picker.is_none(), |ui| self.panel.show(ui, &self.session, models.available_models(), image_models, metadata)).inner;
         for action in actions {
             match action {
                 ChatAction::New => self.session.new_conversation(), ChatAction::Select(id) => self.session.select_conversation(&id), ChatAction::Delete(id) => self.session.delete_conversation(&id), ChatAction::SelectModel(model) => self.session.select_model(model), ChatAction::Draft(text) => self.session.set_draft(text), ChatAction::Stop => self.session.cancel(), ChatAction::Save => self.session.retry_save(),
                 ChatAction::SetComposer(settings) => self.session.set_composer(settings),
+                ChatAction::SetToolbar(tools) => self.session.set_toolbar(tools),
                 ChatAction::UploadAttachment => {
                     if self.picker.is_none() {
                         let (sender, receiver) = mpsc::channel();
@@ -60,13 +61,29 @@ impl ChatState {
                 ChatAction::EditAttempt { .. } => {}, ChatAction::SubmitEdit { conversation_id, turn_id, attempt_id, expected_text, next_text } => { if let Err(error) = self.session.edit_attempt(&conversation_id, &turn_id, &attempt_id, &expected_text, &next_text) { self.session.report(error); } }, ChatAction::DeleteAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.delete_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::SelectAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.select_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::ForkAttempt { conversation_id, turn_id, attempt_id } => { if let Err(error) = self.session.fork_attempt(&conversation_id, &turn_id, &attempt_id) { self.session.report(error); } }, ChatAction::CopyConversation { conversation_id } => { if let Err(error) = self.session.copy_conversation(&conversation_id) { self.session.report(error); } },
                 ChatAction::Send | ChatAction::Retry => {
                     let retry = matches!(action, ChatAction::Retry);
-                    let connection = self.session.request_model(retry).and_then(|model| {
-                        if models.model_settings(&model).is_some_and(|settings| settings.model_type == lumakit_ai::model_config::ModelType::Image) { models.image_connection(&model) }
-                        else { models.connection(&model) }
-                    });
-                    match connection { Ok(connection) => if retry { self.session.retry(connection); } else { self.session.send(connection); }, Err(error) => self.session.report(error) }
+                    let prepared = (|| {
+                        let mut chat_model = self.session.request_model(retry)?;
+                        let legacy_image = models.model_settings(&chat_model).is_some_and(|settings| settings.model_type == lumakit_ai::model_config::ModelType::Image);
+                        if legacy_image { chat_model = self.session.history().model.clone().ok_or("请先选择聊天模型，再重试图片工具。")?; }
+                        let chat = models.connection(&chat_model)?;
+                        let painting = self.session.request_painting_model(retry)?.map(|model| models.image_connection(&model)).transpose()?;
+                        Ok::<_, String>((chat_model, chat, painting, legacy_image))
+                    })();
+                    match prepared {
+                        Ok((model, chat, Some(painting), true)) => { self.session.select_model(model); self.session.retry_with_model_and_painting(chat, painting); },
+                        Ok((_, chat, Some(painting), false)) => if retry { self.session.retry_with_painting(chat, painting); } else { self.session.send_with_painting(chat, painting); },
+                        Ok((_, chat, None, _)) => if retry { self.session.retry(chat); } else { self.session.send(chat); },
+                        Err(error) => self.session.report(error),
+                    }
                 },
-                ChatAction::RetryWith(model) => match models.connection(&model) { Ok(connection) => { self.session.select_model(model); self.session.retry_with(connection); }, Err(error) => self.session.report(error) }, ChatAction::TranslateAttempt { .. } | ChatAction::SubmitTranslation { .. } => self.session.report("翻译宿主尚未接入模型选择".into()),
+                ChatAction::RetryWith(model) => {
+                    let prepared = models.connection(&model).and_then(|chat| self.session.request_painting_model(true)?.map(|painting| models.image_connection(&painting)).transpose().map(|painting| (chat, painting)));
+                    match prepared {
+                        Ok((chat, painting)) => { self.session.select_model(model); if let Some(painting) = painting { self.session.retry_with_model_and_painting(chat, painting); } else { self.session.retry_with(chat); } },
+                        Err(error) => self.session.report(error),
+                    }
+                },
+                ChatAction::TranslateAttempt { .. } | ChatAction::SubmitTranslation { .. } => self.session.report("翻译宿主尚未接入模型选择".into()),
             }
         }
         settings

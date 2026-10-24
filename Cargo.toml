@@ -10,6 +10,8 @@ lumakit-ai = { path = "../LumaKit/crates/lumakit-ai" }
 lumakit-egui = { path = "../LumaKit/crates/lumakit-egui" }
 lumakit-support = { path = "../LumaKit/crates/lumakit-support" }
 lumakit-ui = { path = "../LumaKit/crates/lumakit-ui" }
+lumakit-observability = { path = "../LumaKit/crates/lumakit-observability" }
+tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.40", features = ["bundled"] }

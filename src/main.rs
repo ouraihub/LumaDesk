@@ -28,6 +28,7 @@ enum SettingsPage { Models, Search, Appearance, Mcp }
 
 struct DesktopApp {
     _data_lock: lumakit_support::FileLock,
+    _logs: lumakit_observability::LogHandle,
     models: ModelSettings,
     search: SearchSettings,
     mcp: mcp_settings::McpSettings,
@@ -53,9 +54,11 @@ impl DesktopApp {
         let root = match std::env::var_os("LUMADESK_DATA_DIR") { Some(path) => std::path::PathBuf::from(path), None => lumakit_support::data_root("luma-desk").map_err(|error| error.to_string())? };
         std::fs::create_dir_all(&root).map_err(|_| "无法创建配置目录，请将程序移动到可写目录".to_owned())?;
         let data_lock = lumakit_support::FileLock::acquire(&root.join("lumadesk.lock")).map_err(|_| "此数据目录已在使用，或无法加锁；请关闭另一个实例后重试".to_owned())?;
+        let logs = lumakit_observability::LogHandle::init(&root.join("logs"), lumakit_observability::LogLevel::Info, 5 * 1024 * 1024).map_err(|error| format!("无法初始化诊断日志：{error}"))?;
+        tracing::info!(version = env!("CARGO_PKG_VERSION"), "LumaDesk started");
         let appearance = theme::Appearance::load(&root)?;
         appearance.apply(&cc.egui_ctx);
-        Ok(Self { _data_lock: data_lock, models: ModelSettings::new(&root)?, search: SearchSettings::new(&root)?, mcp: mcp_settings::McpSettings::new(&root)?, chat: chat::ChatState::new(&root, &cc.egui_ctx)?, tabs: vec![TabKind::Launchpad], active: 0, settings: None, settings_query: String::new(), appearance })
+        Ok(Self { _data_lock: data_lock, _logs: logs, models: ModelSettings::new(&root)?, search: SearchSettings::new(&root)?, mcp: mcp_settings::McpSettings::new(&root)?, chat: chat::ChatState::new(&root, &cc.egui_ctx)?, tabs: vec![TabKind::Launchpad], active: 0, settings: None, settings_query: String::new(), appearance })
     }
     fn leave_settings(&mut self) {
         self.models.clear_secrets(); self.search.clear_secrets(); self.mcp.clear_secrets(); self.settings = None;
