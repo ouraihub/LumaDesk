@@ -3,7 +3,7 @@ use lumakit_support::secrets::SavedKey;
 use gpui_kit::{div, prelude::*, AppContext, AnyElement, ClipboardItem, Context, Entity, Render, SharedString, Subscription, Window};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState, Textarea, TextareaState}, Disableable, Selectable, Sizable};
+use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState, Textarea, TextareaState}, Disableable, Sizable};
 use lumakit_design::components::{label, IconButton};
 use lumakit_design::components::settings as ui;
 use lumakit_design::metrics::{radius, size, space, text};
@@ -275,21 +275,20 @@ impl SearchSettings {
         let provider = self.stored.configs[index].provider;
         let inputs = &self.inputs.as_ref().expect("search entity inputs").providers[index];
         let r = lumakit_design::LumaTheme::global(cx).roles;
-        let mut choices = h_flex().flex_wrap().gap(space::S8);
-        for (i, config) in self.stored.configs.iter().enumerate().filter(|(_, config)| config.provider.kind().is_none() == fetch) {
-            // Outline for the current provider, ghost for the others: Kit's `selected` alone barely changes a dark theme.
-            let current = i == index;
-            choices = choices.child(Button::new(("provider", i)).small().label(config.provider.name()).when(current, |b| b.outline().icon(IconName::Check)).when(!current, |b| b.ghost()).selected(current).disabled(busy)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    let old = if fetch { this.fetch_index } else { this.search_index };
-                    if old != i { this.clear_provider(old, window, cx); if fetch { this.fetch_index = i; } else { this.search_index = i; } }
-                    cx.notify();
-                })));
-        }
+        let page = cx.entity();
+        let options: Vec<(usize, SharedString)> = self.stored.configs.iter().enumerate()
+            .filter(|(_, config)| config.provider.kind().is_none() == fetch).map(|(i, config)| (i, config.provider.name().into())).collect();
+        let choices = ui::select(ui::select_button(("provider", usize::from(fetch)), if fetch { "默认读取服务" } else { "默认搜索服务" }, provider.name()).w_full().disabled(busy),
+            Some(index), options, move |i, window, cx| page.update(cx, |this, cx| {
+                let old = if fetch { this.fetch_index } else { this.search_index };
+                if old != i { this.clear_provider(old, window, cx); if fetch { this.fetch_index = i; } else { this.search_index = i; } }
+                cx.notify();
+            }));
+        let choices = v_flex().gap(space::S4).child(choices);
         let site = Button::new(("provider-site", index)).small().link().icon(IconName::ExternalLink)
             .label(if provider == Provider::Direct { "HTTP 说明" } else { "官方网站 / 获取密钥" }).on_click(move |_, _, cx| cx.open_url(provider.link()));
         let mut rows = vec![
-            field("默认服务商", Some(provider.description().into()), choices.child(site), &r),
+            field("默认服务商", Some(provider.description().into()), choices.child(h_flex().child(site)), &r),
             field(if provider == Provider::Direct { "默认读取 URL（可留空）" } else { "服务地址" }, None, Input::new(&inputs.endpoint).disabled(busy), &r),
         ];
         if provider != Provider::Direct {
@@ -376,9 +375,10 @@ impl Render for SearchSettings {
             .label("高级设置").on_click(cx.listener(|this, _, _, cx| { this.advanced = !this.advanced; cx.notify(); }));
         body = body.child(h_flex().child(toggle));
         if self.advanced {
-            let compression = h_flex().flex_wrap().gap(space::S8)
-                .child(Button::new("no-cutoff").small().label("不截断").selected(self.compression == Compression::None).disabled(busy).on_click(cx.listener(|this, _, _, cx| { this.compression = Compression::None; cx.notify(); })))
-                .child(Button::new("use-cutoff").small().label("按 Unicode 字符截断").selected(self.compression == Compression::Cutoff).disabled(busy).on_click(cx.listener(|this, _, _, cx| { this.compression = Compression::Cutoff; cx.notify(); })));
+            let page = cx.entity();
+            let compression = ui::select(ui::select_button("compression", "正文压缩", if self.compression == Compression::Cutoff { "按 Unicode 字符截断" } else { "不截断" }).w_full().disabled(busy),
+                Some(self.compression), [(Compression::None, "不截断".into()), (Compression::Cutoff, "按 Unicode 字符截断".into())],
+                move |value, _, cx| page.update(cx, |this, cx| { this.compression = value; cx.notify(); }));
             body = body.child(v_flex().gap(space::S16)
                 .child(field("结果数", Some("1–50。".into()), Input::new(&inputs.max_results).disabled(busy), &r))
                 .child(field("正文压缩", None, compression, &r))

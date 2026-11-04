@@ -11,6 +11,8 @@ use lumakit_design::components::{label, IconButton};
 use lumakit_design::components::settings as ui;
 use lumakit_design::metrics::{radius, size, space, text};
 
+mod dialogs;
+
 /// Dialog column width (ThinkRail's wide form dialogs).
 const DIALOG_WIDTH: Pixels = px(640.);
 /// The dialog layer is at least this tall, so a short page still frames the dialog.
@@ -22,8 +24,6 @@ const KEY_BOX: Pixels = px(32.);
 /// A model group header and a model row in the models list.
 const GROUP_ROW: Pixels = px(40.);
 const MODEL_ROW: Pixels = px(44.);
-/// A group header in the sync picker.
-const PICK_GROUP: Pixels = px(32.);
 const PROVIDER_FILTERS: [(u8, &str); 3] = [(0, "全部平台"), (1, "已启用"), (2, "已停用")];
 const CAPABILITY_FILTERS: [(u8, &str); 5] = [(0, "全部"), (1, "视觉"), (2, "推理"), (3, "工具"), (4, "联网")];
 
@@ -422,61 +422,6 @@ impl ModelSettings {
             .child(self.icon(format!("edit-model-{id}"), IconName::Settings2, "模型设置", cx, move |this, window, cx| this.open_editor(EditorDialog::Model { provider: this.draft.providers[p].id.clone(), endpoint: this.draft.providers[p].endpoints[e].id.clone(), original: Some(value.id.clone()), value: value.clone() }, window, cx)))
             .child(self.icon(format!("remove-model-{id}"), IconName::Trash, "移除模型", cx, move |this, _, _| this.edit_models(p, e, None, std::slice::from_ref(&id))))
     }
-    fn editor_view(&self, cx: &Context<Self>) -> gpui_kit::Div {
-        let r = roles(cx);
-        let editor = self.editor.as_ref().unwrap();
-        let title = match editor { EditorDialog::Provider { .. } => "服务商设置", EditorDialog::Endpoint { .. } => "线路设置", EditorDialog::Model { .. } => "模型设置", EditorDialog::Keys { .. } => "密钥管理" };
-        let mut body = v_flex().w_full().gap(space::S16).child(dialog_title(title));
-        let mut destructive = None;
-        match editor {
-            EditorDialog::Provider { id, .. } => {
-                body = body.child(ui::field("名称", self.input("name"), &r));
-                if let Some(id) = id { let id = id.clone(); destructive = Some(self.button("delete-provider", "删除服务商…", cx, move |this, window, cx| { this.delete_provider = Some(id.clone()); this.close_editor(window, cx); }).danger()); }
-            }
-            EditorDialog::Endpoint { id, protocol, url, .. } => {
-                let mut protocols = h_flex().flex_wrap().gap(space::S4);
-                for (index, value) in [Protocol::OpenAiChat, Protocol::OpenAiResponses, Protocol::AnthropicMessages].into_iter().enumerate() {
-                    protocols = protocols.child(self.button(("protocol", index), protocol_name(value), cx, move |this, _, _| { if let Some(EditorDialog::Endpoint { protocol, .. }) = &mut this.editor { *protocol = value; } }).outline().selected(*protocol == value));
-                }
-                let request = match model_url(url, *protocol) { Ok(url) => format!("GET {url}"), Err(error) => error };
-                body = body.child(ui::field("线路名称", self.input("name"), &r)).child(ui::field("API 地址", self.input("editor-url"), &r))
-                    .child(ui::field("协议", v_flex().gap(space::S8).child(protocols).child(ui::request_line(request, &r)), &r));
-                if let Some(id) = id { let id = id.clone(); destructive = Some(self.button("delete-endpoint", "删除线路…", cx, move |this, window, cx| { this.delete_endpoint = Some(id.clone()); this.close_editor(window, cx); }).danger()); }
-            }
-            EditorDialog::Model { .. } => {
-                if let Some(model) = &self.view.as_ref().unwrap().model { body = body.child(model.clone()); }
-                body = body.child(hint("保存后从下一次调用生效；正在生成的回复不受影响。", &r));
-            }
-            EditorDialog::Keys { provider, endpoint } => {
-                if let Some(p) = self.draft.providers.iter().position(|p| p.id == *provider) { if let Some(e) = self.draft.providers[p].endpoints.iter().position(|e| e.id == *endpoint) {
-                    let keys = &self.draft.providers[p].endpoints[e].keys;
-                    body = body.child(hint("每条线路最多 16 个，加密保存。", &r));
-                    if !keys.is_empty() { body = body.child(v_flex().gap(space::S6).children(keys.iter().map(|key| self.key_row(p, e, key, cx)))); }
-                    let editing = self.key_drafts.get(endpoint).is_some_and(|draft| draft.editing.is_some());
-                    let mut actions = h_flex().justify_end().gap(space::S8);
-                    if editing { actions = actions.child(self.button("cancel-key-edit", "取消修改", cx, |this, window, cx| { this.key_drafts.clear(); this.set_input("key", "", window, cx); }).outline()); }
-                    actions = actions.child(self.button("save-key", if editing { "保存修改后的密钥" } else { "保存新密钥" }, cx, |this, window, cx| this.save_key_input(window, cx)).primary());
-                    let field = ui::field(if editing { "修改密钥" } else { "添加密钥" }, self.input("key"), &r).when(editing, |d| d.child(hint("空草稿不会清空原密钥", &r)));
-                    body = body.child(field).child(actions);
-                } }
-            }
-        }
-        let keys = matches!(editor, EditorDialog::Keys { .. });
-        let mut footer = h_flex().gap(space::S8).children(destructive).child(div().flex_1())
-            .child(self.button("close-editor", if keys { "完成" } else { "取消" }, cx, |this, window, cx| this.close_editor(window, cx)).outline());
-        if !keys { footer = footer.child(self.button("save-editor", "保存", cx, |this, window, cx| this.save_editor(window, cx)).primary()); }
-        body.child(footer)
-    }
-    /// Delete confirmation: what goes away, a quiet cancel and a destructive confirm.
-    fn delete_view(&self, cx: &Context<Self>) -> gpui_kit::Div {
-        let r = roles(cx);
-        let note = if self.delete_key.is_some() { "将删除此密钥；其它密钥、模型和线路保持不变。" } else if self.delete_provider.is_some() { "将永久删除此服务商及全部线路、模型与密钥。" } else { "将永久删除此线路及模型与密钥。" };
-        v_flex().w_full().gap(space::S16)
-            .child(v_flex().gap(space::S4).child(dialog_title("确认删除")).child(label(text::UI, note).text_color(r.text_muted)))
-            .child(h_flex().justify_end().gap(space::S8)
-                .child(self.button("cancel-delete", "取消", cx, |this, _, _| { this.delete_provider = None; this.delete_endpoint = None; this.delete_key = None; }).outline())
-                .child(self.button("confirm-delete", "确认删除", cx, |this, window, cx| this.delete_confirmed(window, cx)).danger()))
-    }
     /// The page notice and, while an address is unsaved, the retry entry.
     fn status(&self, cx: &Context<Self>) -> Option<gpui_kit::Div> {
         let r = roles(cx);
@@ -493,60 +438,6 @@ impl ModelSettings {
         let rail = if wide { rail.w(size::LIST_COLUMN) } else { rail.w_full() };
         let columns = div().flex().w_full().gap(space::S16).child(rail).child(self.detail_view(cx));
         if wide { columns.flex_row().items_start() } else { columns.flex_col() }
-    }
-    fn sync_view(&self, cx: &Context<Self>) -> gpui_kit::Div {
-        let r = roles(cx);
-        let dialog = self.sync_dialog.as_ref().unwrap(); let query = dialog.search.trim().to_lowercase();
-        let shown: Vec<_> = dialog.ids.iter().filter(|id| id.to_lowercase().contains(&query) && dialog.filter.is_none_or(|kind| dialog.types.get(*id).copied().unwrap_or(ModelType::Chat) == kind)).cloned().collect();
-        let remove = !shown.is_empty() && shown.iter().all(|id| dialog.selected.contains(id)); let ids = shown.clone();
-        let all = dialog.ids.iter().filter(|id| id.to_lowercase().contains(&query)).count();
-        let mut filters = h_flex().flex_wrap().gap(space::S4).child(self.button("sync-filter-all", format!("全部 {all}"), cx, |this, _, _| { if let Some(dialog) = &mut this.sync_dialog { dialog.filter = None; } }).xsmall().ghost().selected(dialog.filter.is_none()));
-        for (index, kind) in MODEL_TYPES.into_iter().enumerate() {
-            let hits = dialog.ids.iter().filter(|id| id.to_lowercase().contains(&query) && dialog.types.get(*id).copied().unwrap_or(ModelType::Chat) == kind).count();
-            filters = filters.child(self.button(("sync-filter", index), format!("{} {hits}", kind.label()), cx, move |this, _, _| { if let Some(dialog) = &mut this.sync_dialog { dialog.filter = Some(kind); } }).xsmall().ghost().selected(dialog.filter == Some(kind)).disabled(hits == 0));
-        }
-        filters = filters.child(div().flex_1()).child(self.button("sync-all", if remove { "全部移除" } else { "全部加入" }, cx, move |this, _, _| {
-            if let Some(dialog) = &this.sync_dialog { let mut selected = dialog.selected.clone(); for id in &ids { if remove { selected.remove(id); } else { selected.insert(id.clone()); } } let types = dialog.types.clone(); this.save_sync(selected, types); }
-        }).outline().small().disabled(shown.is_empty()));
-        let mut body = v_flex().w_full().gap(space::S12)
-            .child(v_flex().gap(space::S4).child(dialog_title(format!("选择模型 {}", dialog.ids.len()))).child(hint("点击加入或移除即保存；不会改动本次目录之外的模型。", &r)))
-            .child(self.input("sync-search").prefix(Icon::new(IconName::Search).small())).child(filters);
-        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
-        for id in shown { let group = id.split(['-', '/', ':']).next().unwrap_or(&id); if let Some((_, ids)) = groups.iter_mut().find(|(name, _)| name == group) { ids.push(id); } else { groups.push((group.into(), vec![id])); } }
-        if groups.is_empty() { body = body.child(ui::empty("没有匹配的模型", &r)); } else {
-            let mut list = v_flex().rounded(radius::LG).border_1().border_color(r.border_muted).overflow_hidden();
-            for (index, (group, ids)) in groups.into_iter().enumerate() {
-                let folded = query.is_empty() && dialog.folded.contains(&group); let name = group.clone();
-                list = list.child(group_header(("sync-group", index), folded, &group, ids.len(), &r).h(PICK_GROUP).px(space::S12).bg(r.container_elevated_bg).when(index > 0, |d| d.border_t_1().border_color(r.border_muted))
-                    .on_click(cx.listener(move |this, _, _, cx| { if let Some(dialog) = &mut this.sync_dialog { if !dialog.folded.remove(&name) { dialog.folded.insert(name.clone()); } } cx.notify(); })));
-                if folded { continue; }
-                list = list.children(ids.iter().map(|id| self.sync_row(id, dialog.selected.contains(id), dialog.types.get(id).copied().unwrap_or(ModelType::Chat), cx)));
-            }
-            body = body.child(list);
-        }
-        body.child(h_flex().gap(space::S8)
-            .child(hint(format!("已选择 {} 个模型", dialog.ids.iter().filter(|id| dialog.selected.contains(*id)).count()), &r).flex_1().min_w(px(0.)))
-            .child(self.button("sync-close", "完成", cx, |this, _, _| this.sync_dialog = None).primary()))
-    }
-    /// One discovered model: id with an add/remove toggle that saves at once, and its type chips.
-    fn sync_row(&self, id: &str, selected: bool, kind: ModelType, cx: &Context<Self>) -> gpui_kit::Div {
-        let r = roles(cx);
-        let model = id.to_owned();
-        let toggle = self.button(format!("sync-select-{id}"), if selected { "移除" } else { "加入" }, cx, move |this, _, _| {
-            if let Some(dialog) = &this.sync_dialog { let mut selected = dialog.selected.clone(); if !selected.remove(&model) { selected.insert(model.clone()); } let types = dialog.types.clone(); this.save_sync(selected, types); }
-        }).xsmall().when(selected, |b| b.outline()).when(!selected, |b| b.primary()).accessibility_label(format!("{} {id}", if selected { "移除模型" } else { "加入模型" }));
-        let mut types = h_flex().flex_wrap().gap(space::S4);
-        for (index, value) in MODEL_TYPES.into_iter().enumerate() {
-            let model = id.to_owned(); types = types.child(self.button(format!("sync-type-{id}-{index}"), value.label(), cx, move |this, _, _| {
-                if let Some(dialog) = &mut this.sync_dialog {
-                    if dialog.selected.contains(&model) { let selected = dialog.selected.clone(); let mut types = dialog.types.clone(); types.insert(model.clone(), value); this.save_sync(selected, types); }
-                    else { dialog.types.insert(model.clone(), value); }
-                }
-            }).xsmall().ghost().selected(kind == value));
-        }
-        v_flex().px(space::S12).py(space::S8).gap(space::S6).border_t_1().border_color(r.border_muted).when(selected, |d| d.bg(r.control_bg_selected))
-            .child(h_flex().gap(space::S8).child(label(text::CODE_TEXT, id.to_owned()).flex_1().min_w(px(0.)).truncate()).child(toggle))
-            .child(types)
     }
 }
 impl Render for ModelSettings {
@@ -587,7 +478,8 @@ impl Render for ModelSettings {
             else if self.editor.is_some() { self.editor_view(cx) } else { self.sync_view(cx) };
         let dialog = v_flex().id("model-settings").size_full().min_h(px(0.)).overflow_y_scroll().p(space::S24).gap(space::S16)
             .track_focus(&focus).on_key_down(escape).child(content).children(self.status(cx));
-        div().relative().w_full().min_h(DIALOG_MIN_HEIGHT)
+        // Keep the dialog bounded when adding models grows the background page.
+        div().relative().w_full().h_full().min_h(DIALOG_MIN_HEIGHT).overflow_hidden()
             .child(v_flex().id("models-background").w_full().gap(space::S16).child(header).child(self.columns(wide, cx)))
             .child(div().absolute().inset_0().occlude().flex().justify_center().items_start().p(space::S12).bg(r.overlay)
                 .child(v_flex().w_full().max_w(DIALOG_WIDTH).h_full().min_h(px(0.)).rounded(radius::LG).border_1().border_color(r.border_default).bg(r.container_elevated_bg).shadow_lg()

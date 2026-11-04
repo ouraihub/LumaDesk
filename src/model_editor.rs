@@ -3,7 +3,7 @@ use std::{collections::BTreeMap, fmt::Display, str::FromStr};
 use gpui_kit::{div, prelude::*, ClipboardItem, Context, Entity, IntoElement, Render, Subscription, Window};
 use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState}, Disableable, Selectable, Sizable};
 use lumakit_design::{LumaTheme, Roles};
-use lumakit_design::components::label;
+use lumakit_design::components::{label, settings::{select, select_button}};
 use lumakit_design::metrics::{radius, space, text as styles};
 use lumakit_ai::{Protocol, catalog::ModelEntry, model_config::{ModelType, ReasoningConfig, ReasoningDialect, ReasoningEffort, ModelPricing, PriceTier}};
 
@@ -53,7 +53,7 @@ fn set_type(value: &mut ModelEntry, kind: ModelType, state: &mut EditorState) {
     }
 }
 fn tier(start: u32) -> PriceTier { PriceTier { min_input_tokens: start, input: 0.0, output: 0.0, cache_read: None, cache_write: None } }
-pub(crate) const MODEL_TYPES: [ModelType; 8] = [ModelType::Chat, ModelType::Image, ModelType::Embedding, ModelType::Rerank, ModelType::Video, ModelType::Tts, ModelType::Stt, ModelType::Unknown];
+pub(crate) const MODEL_TYPES: [ModelType; 8] = [ModelType::Chat, ModelType::Image, ModelType::Video, ModelType::Tts, ModelType::Stt, ModelType::Embedding, ModelType::Rerank, ModelType::Unknown];
 
 pub(crate) struct ModelEditor {
     pub value: ModelEntry,
@@ -140,6 +140,14 @@ impl ModelEditor {
     fn action(&self, id: impl Into<gpui_kit::ElementId>, label: impl Into<gpui_kit::SharedString>, selected: bool, cx: &Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> Button {
         Button::new(id).small().outline().label(label).selected(selected).on_click(cx.listener(move |this, _, window, cx| { action(this, window, cx); cx.notify(); }))
     }
+    /// A dropdown for one choice among `options`; `apply` writes the pick, then the editor re-renders.
+    fn select<T: Copy + PartialEq + 'static>(&self, id: &'static str, name: &'static str, current: Option<T>, options: Vec<(T, &'static str)>, cx: &Context<Self>,
+        apply: impl Fn(&mut Self, T, &mut Window, &mut Context<Self>) + 'static) -> gpui_kit::AnyElement {
+        let shown = options.iter().find(|(value, _)| Some(*value) == current).map_or("请选择", |(_, title)| *title);
+        let page = cx.entity();
+        select(select_button(id, name, shown).w_full(), current, options.into_iter().map(|(value, title)| (value, title.into())),
+            move |value, window, cx| page.update(cx, |this, cx| { apply(this, value, window, cx); cx.notify(); }))
+    }
     fn presets(&self, key: &'static str, values: &[(&'static str, u32)], cx: &Context<Self>) -> gpui_kit::Div {
         let mut row = div().flex().flex_wrap().gap(space::S4);
         for &(label, value) in values {
@@ -160,18 +168,16 @@ impl Render for ModelEditor {
             .child(self.field("id", "模型 ID", self.existing))
             .child(div().flex().child(self.action("copy-id", "复制模型 ID", false, cx, |this, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(this.value.id.clone())))))
             .child(self.field("name", "模型名称（留空使用 ID）", false)).child(self.field("group", "分组名称（留空自动分组）", false));
-        let mut usage = div().flex().flex_wrap().gap(space::S4);
-        for (label, kind, vision) in [("对话", ModelType::Chat, false), ("图像生成", ModelType::Image, false), ("图像编辑", ModelType::Image, true)] {
-            usage = usage.child(self.action(label, label, self.value.settings.model_type == kind && (kind == ModelType::Chat || self.value.capabilities.vision == vision), cx, move |this, window, cx| {
-                set_type(&mut this.value, kind, &mut this.state); if kind == ModelType::Image { this.value.capabilities.vision = vision; } this.prepare_inputs(window, cx);
-            }));
-        }
-        body = body.child(usage).child(div().flex().child(self.action("more", if self.more { "收起更多设置" } else { "更多设置" }, self.more, cx, |this, _, _| this.more = !this.more)));
+        // 用途 combines type and vision: an image model with vision input edits images.
+        let usage = if self.value.settings.model_type == ModelType::Chat { Some((ModelType::Chat, false)) }
+            else if self.value.settings.model_type == ModelType::Image { Some((ModelType::Image, self.value.capabilities.vision)) } else { None };
+        let usage = self.select("usage", "用途", usage, vec![((ModelType::Chat, false), "对话"), ((ModelType::Image, false), "图像生成"), ((ModelType::Image, true), "图像编辑")], cx,
+            |this, (kind, vision), window, cx| { set_type(&mut this.value, kind, &mut this.state); if kind == ModelType::Image { this.value.capabilities.vision = vision; } this.prepare_inputs(window, cx); });
+        body = body.child(div().flex().flex_col().gap(space::S4).child(group_label("用途")).child(usage));
+        body = body.child(div().flex().child(self.action("more", if self.more { "收起更多设置" } else { "更多设置" }, self.more, cx, |this, _, _| this.more = !this.more)));
         if self.more {
-            let mut kinds = div().flex().flex_wrap().gap(space::S4);
-            for (index, kind) in MODEL_TYPES.into_iter().enumerate() {
-                kinds = kinds.child(self.action(("kind", index), kind.label(), self.value.settings.model_type == kind, cx, move |this, window, cx| { set_type(&mut this.value, kind, &mut this.state); this.prepare_inputs(window, cx); }));
-            }
+            let kinds = self.select("kind", "模型类型", Some(self.value.settings.model_type), MODEL_TYPES.into_iter().map(|kind| (kind, kind.label())).collect(), cx,
+                |this, kind, window, cx| { set_type(&mut this.value, kind, &mut this.state); this.prepare_inputs(window, cx); });
             body = body.child(group_label("模型类型")).child(kinds);
             if self.value.settings.model_type == ModelType::Chat {
                 let tools = self.value.settings.supports_tools;
@@ -187,10 +193,9 @@ impl Render for ModelEditor {
                     body = body.child(div().flex().child(self.action("web", "原生联网（可能产生额外费用）", self.value.settings.native_web_search, cx, |this, _, _| this.value.settings.native_web_search = !this.value.settings.native_web_search)));
                 }
                 if let Some(config) = &self.value.settings.reasoning {
-                    let mut dialects = div().flex().flex_wrap().gap(space::S4);
-                    for (index, (dialect, label)) in [(ReasoningDialect::OpenAi, "OpenAI"), (ReasoningDialect::AnthropicBudget, "Anthropic 预算"), (ReasoningDialect::AnthropicAdaptive, "Anthropic 自适应"), (ReasoningDialect::ThinkingType, "Thinking type"), (ReasoningDialect::Qwen, "Qwen")].into_iter().enumerate() {
-                        if fits(dialect, self.protocol) { dialects = dialects.child(self.action(("dialect", index), label, config.dialect == dialect, cx, move |this, window, cx| { this.value.settings.reasoning = Some(reasoning(dialect)); this.reset("reasoning", window, cx); })); }
-                    }
+                    let dialects = [(ReasoningDialect::OpenAi, "OpenAI"), (ReasoningDialect::AnthropicBudget, "Anthropic 预算"), (ReasoningDialect::AnthropicAdaptive, "Anthropic 自适应"), (ReasoningDialect::ThinkingType, "Thinking type"), (ReasoningDialect::Qwen, "Qwen")]
+                        .into_iter().filter(|(dialect, _)| fits(*dialect, self.protocol)).collect();
+                    let dialects = self.select("dialect", "推理方言", Some(config.dialect), dialects, cx, |this, dialect, window, cx| { this.value.settings.reasoning = Some(reasoning(dialect)); this.reset("reasoning", window, cx); });
                     let mut efforts = div().flex().flex_wrap().gap(space::S4);
                     for (index, (effort, label)) in [(ReasoningEffort::None, "none"), (ReasoningEffort::Auto, "auto"), (ReasoningEffort::Minimal, "minimal"), (ReasoningEffort::Low, "low"), (ReasoningEffort::Medium, "medium"), (ReasoningEffort::High, "high"), (ReasoningEffort::Xhigh, "xhigh"), (ReasoningEffort::Max, "max")].into_iter().enumerate() {
                         if effort == ReasoningEffort::Auto && !auto(config.dialect) { continue; }
@@ -208,9 +213,9 @@ impl Render for ModelEditor {
             if self.value.settings.model_type == ModelType::Chat {
                 body = body.child(group_label("价格（每百万 token）"));
                 if let Some(pricing) = &self.value.settings.pricing {
-                    let mut currencies = div().flex().gap(space::S4);
-                    for currency in ["USD", "CNY"] { currencies = currencies.child(self.action(currency, currency, pricing.currency == currency, cx, move |this, _, _| { if let Some(pricing) = &mut this.value.settings.pricing { pricing.currency = currency.into(); } })); }
-                    body = body.child(currencies);
+                    let currencies = self.select("currency", "币种", ["USD", "CNY"].into_iter().find(|c| pricing.currency == *c), vec![("USD", "USD"), ("CNY", "CNY")], cx,
+                        |this, currency, _, _| { if let Some(pricing) = &mut this.value.settings.pricing { pricing.currency = currency.into(); } });
+                    body = body.child(div().flex().flex_col().gap(space::S4).child(group_label("币种")).child(currencies));
                     for (index, _) in pricing.tiers.iter().enumerate() {
                         let mut row = div().flex().flex_col().gap(space::S8).p(space::S12).border_1().border_color(r.border_muted).rounded(radius::MD).child(group_label(format!("第 {} 档", index + 1)));
                         for (field, label) in [("start", "起点（输入 token）"), ("input", "输入价格"), ("output", "输出价格"), ("read", "缓存读取（留空同输入）"), ("write", "缓存写入（留空同输入）")] { row = row.child(self.field(&format!("pricing.{index}.{field}"), label, index == 0 && field == "start")); }
