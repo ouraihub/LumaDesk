@@ -1,6 +1,13 @@
 //! 独立网络搜索/读取设置；不与模型线路共享明文、草稿或凭据。
 use lumakit_support::secrets::SavedKey;
-use eframe::egui::{self, Ui};
+use gpui_kit::{div, prelude::*, AppContext, AnyElement, ClipboardItem, Context, Entity, Render, SharedString, Subscription, Window};
+use gpui_kit::assets::IconName;
+use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState, Textarea, TextareaState}, Disableable, Selectable, Sizable};
+use lumakit_design::components::{label, IconButton};
+use lumakit_design::components::settings as ui;
+use lumakit_design::metrics::{radius, size, space, text};
+use lumakit_design::Roles;
 use futures_util::StreamExt;
 use lumakit_ai::search::{self, SearchHit, SearchPreferences, SearchResult};
 use lumakit_ai::search_adapters::SearchAdapterKind;
@@ -12,6 +19,19 @@ use zeroize::Zeroize;
 use crate::settings_store::{self, SearchConfigRow, SearchData, SearchKeyRow};
 
 const FILE: &str = "search-settings.json";
+const BLACKLIST_HEIGHT: gpui_kit::Pixels = gpui_kit::px(112.);
+const VALUE_BOX: gpui_kit::Pixels = gpui_kit::px(32.);
+
+/// A form field with an optional subtle help line under its control.
+fn field(title: &'static str, note: Option<SharedString>, control: impl IntoElement, r: &Roles) -> AnyElement {
+    ui::field(title, v_flex().gap(space::S4).child(control)
+        .when_some(note, |this, note| this.child(label(text::METADATA, note).text_color(r.text_subtle))), r).into_any_element()
+}
+
+/// A settings group whose fields are stacked under its title.
+fn fields(title: &'static str, rows: impl IntoIterator<Item = AnyElement>, r: &Roles) -> AnyElement {
+    ui::group(title, None, r).child(v_flex().gap(space::S16).pt(space::S12).children(rows)).into_any_element()
+}
 const MAX_BODY: usize = 2 * 1024 * 1024;
 const PROVIDERS: [Provider; 5] = [Provider::Tavily, Provider::Brave, Provider::Exa, Provider::Direct, Provider::Jina];
 
@@ -74,13 +94,45 @@ enum Output { Search(SearchResult), Fetch(Page) }
 struct Job { cancel: CancellationToken, thread: thread::JoinHandle<()>, receiver: mpsc::Receiver<Result<Output, String>>, discard: bool }
 enum KeyAction { Add, Replace(String, String), Delete(String) }
 
+struct ProviderInputs { endpoint: Entity<InputState>, key: Entity<InputState>, edit: Entity<InputState> }
+struct SearchInputs {
+    providers: Vec<ProviderInputs>, query: Entity<InputState>, target: Entity<InputState>,
+    max_results: Entity<InputState>, cutoff: Entity<InputState>, blacklist: Entity<TextareaState>,
+    _subscriptions: Vec<Subscription>,
+}
+
 pub struct SearchSettings {
     root: PathBuf, stored: Stored, drafts: Vec<Draft>, search_index: usize, fetch_index: usize,
     preferences: SearchPreferences, compression: Compression, blacklist: String,
     query: String, target: String, result: Option<SearchResult>, page: Option<Page>, status: String, job: Option<Job>,
+    inputs: Option<SearchInputs>, advanced: bool, delete_key: Option<(usize, String)>,
 }
 impl SearchSettings {
-    pub fn new(root: &Path) -> Result<Self, String> {
+    pub fn create(root: &Path, window: &mut Window, cx: &mut gpui_kit::App) -> Result<Entity<Self>, String> {
+        let this = Self::load(root)?;
+        Ok(cx.new(|cx| this.with_inputs(window, cx)))
+    }
+    fn with_inputs(mut self, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let this = &mut self;
+        let mut subscriptions = Vec::new();
+        let mut input = |value: String, secret: bool, window: &mut Window, cx: &mut Context<Self>| {
+            let state = cx.new(|cx| InputState::new(window, cx).default_value(value).masked(secret));
+            subscriptions.push(cx.subscribe(&state, |_, _, event: &InputEvent, cx| { if matches!(event, InputEvent::Change) { cx.notify(); } }));
+            state
+        };
+        let providers = this.drafts.iter().map(|draft| ProviderInputs {
+            endpoint: input(draft.endpoint.clone(), false, window, cx), key: input(String::new(), true, window, cx), edit: input(String::new(), true, window, cx),
+        }).collect();
+        let query = input(String::new(), false, window, cx);
+        let target = input(String::new(), false, window, cx);
+        let max_results = input(this.preferences.max_results.to_string(), false, window, cx);
+        let cutoff = input(this.preferences.cutoff.to_string(), false, window, cx);
+        let blacklist = cx.new(|cx| TextareaState::new(window, cx).default_value(this.blacklist.clone()));
+        subscriptions.push(cx.subscribe(&blacklist, |_, _, event: &InputEvent, cx| { if matches!(event, InputEvent::Change) { cx.notify(); } }));
+        this.inputs = Some(SearchInputs { providers, query, target, max_results, cutoff, blacklist, _subscriptions: subscriptions });
+        self
+    }
+    fn load(root: &Path) -> Result<Self, String> {
         let stored = match settings_store::load_search(root)? {
             Some(data) => Stored::from_database(data)?,
             None => {
@@ -96,9 +148,56 @@ impl SearchSettings {
         let drafts = stored.configs.iter().map(|c| Draft::new(&c.endpoint)).collect();
         let search_index = stored.configs.iter().position(|c| c.provider == stored.default_search).ok_or("缺少默认搜索配置")?;
         let fetch_index = stored.configs.iter().position(|c| c.provider == stored.default_fetch).ok_or("缺少默认读取配置")?;
-        Ok(Self { root: root.to_owned(), preferences: stored.preferences.clone(), compression: stored.compression, blacklist: stored.preferences.blacklist.join("\n"), stored, drafts, search_index, fetch_index, query: String::new(), target: String::new(), result: None, page: None, status: String::new(), job: None })
+        Ok(Self { root: root.to_owned(), preferences: stored.preferences.clone(), compression: stored.compression, blacklist: stored.preferences.blacklist.join("\n"), stored, drafts, search_index, fetch_index, query: String::new(), target: String::new(), result: None, page: None, status: String::new(), job: None, inputs: None, advanced: false, delete_key: None })
     }
-    pub fn clear_secrets(&mut self) { for d in &mut self.drafts { d.clear(); } if let Some(job) = &mut self.job { job.cancel.cancel(); job.discard = true; } }
+    fn cancel_and_clear(&mut self) { for d in &mut self.drafts { d.clear(); } self.delete_key = None; if let Some(job) = &mut self.job { job.cancel.cancel(); job.discard = true; } }
+    pub fn clear_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.cancel_and_clear();
+        if let Some(inputs) = &self.inputs { for provider in &inputs.providers {
+            provider.key.update(cx, |input, cx| input.set_value("", window, cx));
+            provider.edit.update(cx, |input, cx| input.set_value("", window, cx));
+        } }
+        cx.notify();
+    }
+    pub fn is_busy(&self) -> bool { self.job.is_some() }
+    pub fn poll(&mut self) -> bool {
+        if !self.job.as_ref().is_some_and(|job| job.thread.is_finished()) { return false; }
+        self.drain(); true
+    }
+    fn read_inputs(&mut self, cx: &Context<Self>) -> bool {
+        let inputs = self.inputs.as_ref().expect("search entity inputs");
+        for (draft, input) in self.drafts.iter_mut().zip(&inputs.providers) {
+            draft.endpoint = input.endpoint.read(cx).value().to_string();
+            draft.key.zeroize(); draft.key = input.key.read(cx).value().to_string();
+            draft.edit_value.zeroize(); draft.edit_value = input.edit.read(cx).value().to_string();
+        }
+        self.query = inputs.query.read(cx).value().to_string();
+        self.target = inputs.target.read(cx).value().to_string();
+        self.blacklist = inputs.blacklist.read(cx).value().to_string();
+        let max_results = inputs.max_results.read(cx).value().trim().parse();
+        let cutoff = inputs.cutoff.read(cx).value().trim().parse();
+        match (max_results, cutoff) {
+            (Ok(max_results), Ok(cutoff)) => { self.preferences.max_results = max_results; self.preferences.cutoff = cutoff; true }
+            _ => { self.status = "结果数须为 1–50，截断长度须为 100–20000 的整数".into(); false }
+        }
+    }
+    fn submit(&mut self, index: usize, mut action: Option<KeyAction>, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.read_inputs(cx) {
+            if let Some(KeyAction::Replace(_, value)) = &mut action { value.zeroize(); }
+            return false;
+        }
+        if !self.save_clicked(index, action) { return false; }
+        let inputs = self.inputs.as_ref().expect("search entity inputs");
+        if self.drafts[index].key.is_empty() { inputs.providers[index].key.update(cx, |input, cx| input.set_value("", window, cx)); }
+        inputs.blacklist.update(cx, |input, cx| input.set_value(self.blacklist.clone(), window, cx));
+        true
+    }
+    fn clear_provider(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.drafts[index].clear(); self.delete_key = None;
+        let input = &self.inputs.as_ref().expect("search entity inputs").providers[index];
+        input.key.update(cx, |input, cx| input.set_value("", window, cx));
+        input.edit.update(cx, |input, cx| input.set_value("", window, cx));
+    }
     fn save(&mut self, index: usize, action: Option<KeyAction>) -> Result<(), String> {
         let mut next = self.stored.clone();
         next.default_search = next.configs[self.search_index].provider;
@@ -170,77 +269,159 @@ impl SearchSettings {
             }
         }
     }
-    pub fn ui(&mut self, ui: &mut Ui) {
-        self.drain();
-        if ui.input(|input| input.key_pressed(egui::Key::Escape)) { self.clear_secrets(); }
-        if self.job.is_some() { ui.ctx().request_repaint_after(Duration::from_millis(40)); }
-        egui::ScrollArea::vertical().id_salt("search-settings-scroll").show(ui, |ui| {
-            ui.heading("网络搜索");
-            ui.label("仅在点击检测、搜索或读取时联网；搜索词会发送给所选搜索服务，读取 URL 会发送给所选读取服务。");
-            let busy = self.job.is_some();
-            ui.add_enabled_ui(!busy, |ui| {
-                self.provider_ui(ui, false);
-                ui.separator(); ui.label("搜索词"); ui.add(egui::TextEdit::singleline(&mut self.query).desired_width(ui.available_width()).hint_text("输入实际查询内容"));
-                ui.horizontal_wrapped(|ui| { if ui.button("搜索 / 检测").clicked() { self.begin(false); } ui.label("使用当前草稿先保存，再发送真实查询。"); });
-                ui.separator(); self.provider_ui(ui, true);
-                ui.label("读取 URL"); ui.add(egui::TextEdit::singleline(&mut self.target).desired_width(ui.available_width()).hint_text("HTTPS 或回环 HTTP；可留空使用直接获取的默认 URL"));
-                if ui.button("读取 / 检测").clicked() { self.begin(true); }
-                egui::CollapsingHeader::new("高级设置").id_salt("search-preferences").default_open(false).show(ui, |ui| {
-                    ui.horizontal_wrapped(|ui| { ui.label("结果数"); ui.add(egui::DragValue::new(&mut self.preferences.max_results).range(1..=50)); });
-                    ui.horizontal_wrapped(|ui| { ui.radio_value(&mut self.compression, Compression::None, "不截断"); ui.radio_value(&mut self.compression, Compression::Cutoff, "按 Unicode 字符截断"); ui.add_enabled(self.compression == Compression::Cutoff, egui::DragValue::new(&mut self.preferences.cutoff).range(100..=20_000)); });
-                    ui.label("黑名单：每行一条，最多 32 条、每条 256 字符；域名含子域，URL 路径区分大小写。");
-                    ui.add(egui::TextEdit::multiline(&mut self.blacklist).desired_width(ui.available_width()).desired_rows(4));
-                    if ui.button("保存高级设置及默认服务商").clicked() { self.save_clicked(self.search_index, None); }
-                });
-                let mut native = false; ui.add_enabled(false, egui::Checkbox::new(&mut native, "优先模型原生搜索"));
-                ui.small("当前桌面宿主未接入原生搜索路由，此选项不可用。本页黑名单和压缩只控制本页外部搜索/读取。");
-            });
-            if self.job.is_some() && ui.button("取消请求").clicked() { if let Some(job) = &mut self.job { job.cancel.cancel(); } }
-            if !self.status.is_empty() { ui.separator(); ui.label(&self.status); }
-            if let Some(result) = &self.result { for (i, hit) in result.hits.iter().enumerate() { ui.push_id(("hit", i), |ui| { ui.strong(if hit.title.is_empty() { "（无标题）" } else { &hit.title }); ui.hyperlink_to(&hit.url, &hit.url); ui.label(&hit.snippet); ui.separator(); }); } }
-            if let Some(page) = &self.page { ui.heading(&page.title); ui.hyperlink_to(&page.url, &page.url); ui.label(&page.body); }
-        });
+    fn provider_ui(&self, fetch: bool, cx: &mut Context<Self>) -> gpui_kit::AnyElement {
+        let busy = self.is_busy();
+        let index = if fetch { self.fetch_index } else { self.search_index };
+        let provider = self.stored.configs[index].provider;
+        let inputs = &self.inputs.as_ref().expect("search entity inputs").providers[index];
+        let r = lumakit_design::LumaTheme::global(cx).roles;
+        let mut choices = h_flex().flex_wrap().gap(space::S8);
+        for (i, config) in self.stored.configs.iter().enumerate().filter(|(_, config)| config.provider.kind().is_none() == fetch) {
+            // Outline for the current provider, ghost for the others: Kit's `selected` alone barely changes a dark theme.
+            let current = i == index;
+            choices = choices.child(Button::new(("provider", i)).small().label(config.provider.name()).when(current, |b| b.outline().icon(IconName::Check)).when(!current, |b| b.ghost()).selected(current).disabled(busy)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let old = if fetch { this.fetch_index } else { this.search_index };
+                    if old != i { this.clear_provider(old, window, cx); if fetch { this.fetch_index = i; } else { this.search_index = i; } }
+                    cx.notify();
+                })));
+        }
+        let site = Button::new(("provider-site", index)).small().link().icon(IconName::ExternalLink)
+            .label(if provider == Provider::Direct { "HTTP 说明" } else { "官方网站 / 获取密钥" }).on_click(move |_, _, cx| cx.open_url(provider.link()));
+        let mut rows = vec![
+            field("默认服务商", Some(provider.description().into()), choices.child(site), &r),
+            field(if provider == Provider::Direct { "默认读取 URL（可留空）" } else { "服务地址" }, None, Input::new(&inputs.endpoint).disabled(busy), &r),
+        ];
+        if provider != Provider::Direct {
+            let mut keys = v_flex().gap(space::S8);
+            for (key_index, key) in self.stored.configs[index].keys.iter().enumerate() {
+                keys = keys.child(self.key_row(index, key_index, key, busy, cx));
+            }
+            keys = keys.child(h_flex().gap(space::S8).child(div().flex_1().min_w_0().child(Input::new(&inputs.key).disabled(busy)))
+                .child(Button::new(("add-key", index)).small().outline().icon(IconName::Plus).label("添加密钥").disabled(busy).on_click(cx.listener(move |this, _, window, cx| { this.submit(index, Some(KeyAction::Add), window, cx); cx.notify(); }))));
+            rows.push(field("API 密钥", Some("留空保留已有凭据；仅在 HTTP 401/403/429 时轮换其余密钥，最多 16 次，不跨服务商重试。".into()), keys, &r));
+        }
+        rows.push(h_flex().justify_end().child(Button::new(("save-provider", index)).small().primary().label("保存设置").disabled(busy)
+            .on_click(cx.listener(move |this, _, window, cx| { this.submit(index, None, window, cx); cx.notify(); }))).into_any_element());
+        fields(if fetch { "网页读取" } else { "网页搜索" }, rows, &r)
     }
-    fn provider_ui(&mut self, ui: &mut Ui, fetch: bool) {
-        ui.push_id(if fetch { "fetch-config" } else { "search-config" }, |ui| {
-            let index = if fetch { &mut self.fetch_index } else { &mut self.search_index };
-            ui.horizontal_wrapped(|ui| {
-                ui.strong(if fetch { "网页读取" } else { "网页搜索" });
-                egui::ComboBox::from_id_salt("provider").selected_text(self.stored.configs[*index].provider.name()).show_ui(ui, |ui| {
-                    for (i, c) in self.stored.configs.iter().enumerate().filter(|(_, c)| c.provider.kind().is_none() == fetch) { ui.selectable_value(index, i, c.provider.name()); }
-                });
-            });
-            let index = *index; let provider = self.stored.configs[index].provider;
-            ui.label(provider.description()); ui.hyperlink_to(if provider == Provider::Direct { "HTTP 说明" } else { "官方网站 / 获取密钥" }, provider.link());
-            ui.label(if provider == Provider::Direct { "默认读取 URL（可留空）" } else { "服务地址" });
-            ui.add(egui::TextEdit::singleline(&mut self.drafts[index].endpoint).desired_width(ui.available_width()));
-            if provider != Provider::Direct {
-                ui.label("API 密钥"); ui.add(egui::TextEdit::singleline(&mut self.drafts[index].key).password(true).desired_width(ui.available_width()).hint_text("留空保留已有密钥；删除需点击列表删除"));
-                ui.horizontal_wrapped(|ui| { if ui.button("添加密钥").clicked() { self.save_clicked(index, Some(KeyAction::Add)); } if ui.button("保存设置").clicked() { self.save_clicked(index, None); } });
-                ui.small("仅在 HTTP 401/403/429 时依次尝试其余密钥，最多 16 次；不跨服务商重试。网络异常、取消和 5xx 不轮换。");
-                let keys = self.stored.configs[index].keys.clone();
-                for key in keys { ui.push_id(&key.id, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(&key.masked);
-                        if ui.button("显示 / 隐藏").clicked() {
-                            if self.drafts[index].revealed.as_ref().is_some_and(|(id, _)| id == &key.id) { self.drafts[index].clear(); }
-                            else { match key.open() { Ok(value) => { if let Some((_, mut old)) = self.drafts[index].revealed.take() { old.zeroize(); } self.drafts[index].revealed = Some((key.id.clone(), value.to_string())); }, Err(e) => self.status = e } }
-                        }
-                        if ui.button("复制").clicked() { match key.open() { Ok(value) => ui.ctx().copy_text(value.to_string()), Err(e) => self.status = e } }
-                        if ui.button("修改").clicked() { self.drafts[index].editing = Some(key.id.clone()); self.drafts[index].edit_value.zeroize(); }
-                        if ui.button("删除此密钥").clicked() { if self.save_clicked(index, Some(KeyAction::Delete(key.id.clone()))) { self.drafts[index].clear(); } }
-                    });
-                    if let Some((id, value)) = &self.drafts[index].revealed { if id == &key.id { ui.label(value); } }
-                    if self.drafts[index].editing.as_deref() == Some(&key.id) {
-                        ui.add(egui::TextEdit::singleline(&mut self.drafts[index].edit_value).password(true).desired_width(ui.available_width()));
-                        ui.horizontal_wrapped(|ui| { if ui.button("保存修改").clicked() { let value = self.drafts[index].edit_value.clone(); if self.save_clicked(index, Some(KeyAction::Replace(key.id.clone(), value))) { self.drafts[index].clear(); } } if ui.button("取消修改").clicked() { self.drafts[index].edit_value.zeroize(); self.drafts[index].editing = None; } });
-                    }
-                }); }
-            } else if ui.button("保存直接读取设置").clicked() { self.save_clicked(index, None); }
-        });
+
+    /// One saved key: masked value with icon actions; reveal, edit and delete expand below it.
+    fn key_row(&self, index: usize, key_index: usize, key: &SavedKey, busy: bool, cx: &mut Context<Self>) -> gpui_kit::Div {
+        let r = lumakit_design::LumaTheme::global(cx).roles;
+        let inputs = &self.inputs.as_ref().expect("search entity inputs").providers[index];
+        let id = index * 16 + key_index;
+        let revealed = self.drafts[index].revealed.as_ref().filter(|(revealed, _)| revealed == &key.id).map(|(_, value)| value.clone());
+        let actions = h_flex().gap(space::S2)
+            .child(IconButton::new(("reveal-key", id), if revealed.is_some() { IconName::EyeOff } else { IconName::Eye }).tooltip(if revealed.is_some() { "隐藏密钥" } else { "显示密钥" }).disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let key = &this.stored.configs[index].keys[key_index];
+                    if this.drafts[index].revealed.as_ref().is_some_and(|(id, _)| id == &key.id) {
+                        if let Some((_, mut value)) = this.drafts[index].revealed.take() { value.zeroize(); }
+                    } else { match key.open() {
+                        Ok(value) => { if let Some((_, mut old)) = this.drafts[index].revealed.take() { old.zeroize(); } this.drafts[index].revealed = Some((key.id.clone(), value.to_string())); }
+                        Err(error) => this.status = error,
+                    } }
+                    cx.notify();
+                })))
+            .child(IconButton::new(("copy-key", id), IconName::Copy).tooltip("复制密钥").disabled(busy).on_click(cx.listener(move |this, _, _, cx| {
+                match this.stored.configs[index].keys[key_index].open() { Ok(value) => cx.write_to_clipboard(ClipboardItem::new_string(value.to_string())), Err(error) => this.status = error } cx.notify();
+            })))
+            .child(IconButton::new(("edit-key", id), IconName::SquarePen).tooltip("修改密钥").disabled(busy).on_click(cx.listener(move |this, _, window, cx| {
+                this.clear_provider(index, window, cx); this.drafts[index].editing = Some(this.stored.configs[index].keys[key_index].id.clone()); cx.notify();
+            })))
+            .child(IconButton::new(("delete-key", id), IconName::Trash).tooltip("删除密钥").disabled(busy).on_click(cx.listener(move |this, _, _, cx| { this.delete_key = Some((index, this.stored.configs[index].keys[key_index].id.clone())); cx.notify(); })));
+        let mut row = v_flex().gap(space::S8)
+            .child(h_flex().h(VALUE_BOX).px(space::S8).gap(space::S8).rounded(radius::MD).border_1().border_color(r.border_default)
+                .child(label(text::CODE_TEXT, SharedString::from(revealed.unwrap_or_else(|| key.masked.clone()))).flex_1().min_w_0().truncate()).child(actions));
+        if self.delete_key.as_ref().is_some_and(|(i, key_id)| *i == index && key_id == &key.id) {
+            row = row.child(h_flex().flex_wrap().gap(space::S8).child(label(text::METADATA, "确认删除此密钥？").flex_1().text_color(r.feedback_error))
+                .child(Button::new(("cancel-delete", id)).small().ghost().label("取消").on_click(cx.listener(|this, _, _, cx| { this.delete_key = None; cx.notify(); })))
+                .child(Button::new(("confirm-delete", id)).small().danger().label("确认删除").disabled(busy).on_click(cx.listener(move |this, _, window, cx| {
+                    let key_id = this.stored.configs[index].keys[key_index].id.clone();
+                    if this.submit(index, Some(KeyAction::Delete(key_id)), window, cx) { this.clear_provider(index, window, cx); } cx.notify();
+                }))));
+        }
+        if self.drafts[index].editing.as_deref() == Some(key.id.as_str()) {
+            row = row.child(Input::new(&inputs.edit).disabled(busy)).child(h_flex().justify_end().gap(space::S8)
+                .child(Button::new(("cancel-key-edit", id)).small().ghost().label("取消修改").on_click(cx.listener(move |this, _, window, cx| { this.clear_provider(index, window, cx); cx.notify(); })))
+                .child(Button::new(("save-key-edit", id)).small().primary().label("保存修改").disabled(busy).on_click(cx.listener(move |this, _, window, cx| {
+                    let key_id = this.stored.configs[index].keys[key_index].id.clone();
+                    let value = this.inputs.as_ref().expect("search entity inputs").providers[index].edit.read(cx).value().to_string();
+                    if this.submit(index, Some(KeyAction::Replace(key_id, value)), window, cx) { this.clear_provider(index, window, cx); } cx.notify();
+                }))));
+        }
+        row
     }
 }
-impl Drop for SearchSettings { fn drop(&mut self) { self.clear_secrets(); if let Some(job) = self.job.take() { let _ = job.thread.join(); } } }
+
+impl Render for SearchSettings {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let busy = self.is_busy();
+        let inputs = self.inputs.as_ref().expect("search entity inputs");
+        let r = lumakit_design::LumaTheme::global(cx).roles;
+        let run = |input: &Entity<InputState>, id: &'static str, label: &'static str, icon: IconName, fetch: bool, cx: &mut Context<Self>| {
+            h_flex().gap(space::S8).child(div().flex_1().min_w_0().child(Input::new(input).disabled(busy)))
+                .child(Button::new(id).small().outline().icon(icon).label(label).disabled(busy).on_click(cx.listener(move |this, _, window, cx| { this.start_request(fetch, window, cx); })))
+        };
+        let try_rows = vec![
+            field("搜索词", None, run(&inputs.query, "run-search", "搜索 / 检测", IconName::Search, false, cx), &r),
+            field("读取 URL", Some("HTTPS 或回环 HTTP；留空使用默认 URL。".into()), run(&inputs.target, "run-fetch", "读取 / 检测", IconName::Globe, true, cx), &r),
+        ];
+        let mut body = v_flex().id("search-settings").w_full().max_w(size::CONTENT_MAX).gap(space::S24)
+            .child(ui::page_header("网络搜索", Some("仅点击搜索或读取时联网；搜索词和读取 URL 会发送给所选服务。当前桌面宿主未接入模型原生搜索路由。".into()), &r))
+            .child(self.provider_ui(false, cx)).child(self.provider_ui(true, cx))
+            .child(fields("检测", try_rows, &r));
+        let toggle = Button::new("advanced-search").small().ghost().icon(if self.advanced { IconName::ChevronDown } else { IconName::ChevronRight })
+            .label("高级设置").on_click(cx.listener(|this, _, _, cx| { this.advanced = !this.advanced; cx.notify(); }));
+        body = body.child(h_flex().child(toggle));
+        if self.advanced {
+            let compression = h_flex().flex_wrap().gap(space::S8)
+                .child(Button::new("no-cutoff").small().label("不截断").selected(self.compression == Compression::None).disabled(busy).on_click(cx.listener(|this, _, _, cx| { this.compression = Compression::None; cx.notify(); })))
+                .child(Button::new("use-cutoff").small().label("按 Unicode 字符截断").selected(self.compression == Compression::Cutoff).disabled(busy).on_click(cx.listener(|this, _, _, cx| { this.compression = Compression::Cutoff; cx.notify(); })));
+            body = body.child(v_flex().gap(space::S16)
+                .child(field("结果数", Some("1–50。".into()), Input::new(&inputs.max_results).disabled(busy), &r))
+                .child(field("正文压缩", None, compression, &r))
+                .child(field("截断长度", Some("100–20000 个字符。".into()), Input::new(&inputs.cutoff).disabled(busy || self.compression != Compression::Cutoff), &r))
+                .child(field("黑名单", Some("每行一条，最多 32 条、每条 256 字符；域名含子域，URL 路径区分大小写。只控制本页外部搜索/读取。".into()), Textarea::new(&inputs.blacklist).h(BLACKLIST_HEIGHT).disabled(busy), &r))
+                .child(h_flex().justify_end().child(Button::new("save-search-advanced").small().primary().label("保存高级设置及默认服务商").disabled(busy)
+                    .on_click(cx.listener(|this, _, window, cx| { this.submit(this.search_index, None, window, cx); cx.notify(); })))));
+        }
+        if busy || !self.status.is_empty() {
+            body = body.child(h_flex().gap(space::S8).child(label(text::METADATA, self.status.clone()).flex_1().text_color(r.text_subtle))
+                .when(busy, |this| this.child(Button::new("cancel-search").small().ghost().icon(IconName::Close).label("取消请求").on_click(cx.listener(|this, _, _, cx| { if let Some(job) = &mut this.job { job.cancel.cancel(); } cx.notify(); })))));
+        }
+        if let Some(result) = &self.result {
+            let hits = result.hits.iter().enumerate().map(|(i, hit)| {
+                let url = hit.url.clone();
+                v_flex().gap(space::S4).py(space::S12).border_b_1().border_color(r.border_muted)
+                    .child(label(text::UI, if hit.title.is_empty() { "（无标题）".to_owned() } else { hit.title.clone() }))
+                    .child(h_flex().child(Button::new(("search-hit", i)).small().link().label(hit.url.clone()).on_click(move |_, _, cx| cx.open_url(&url))))
+                    .child(label(text::METADATA, hit.snippet.clone()).text_color(r.text_subtle))
+            }).collect::<Vec<_>>();
+            if !hits.is_empty() { body = body.child(ui::group("搜索结果", None, &r).children(hits)); }
+        }
+        if let Some(result) = &self.page {
+            let url = result.url.clone();
+            body = body.child(ui::group("读取结果", None, &r).child(v_flex().gap(space::S8).pt(space::S12).child(label(text::UI, result.title.clone()))
+                .child(h_flex().child(Button::new("fetched-url").small().link().label(result.url.clone()).on_click(move |_, _, cx| cx.open_url(&url))))
+                .child(label(text::READING, result.body.clone()))));
+        }
+        body.on_key_down(cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| { if event.keystroke.key == "escape" { this.clear_secrets(window, cx); } }))
+    }
+}
+
+impl SearchSettings {
+    fn start_request(&mut self, fetch: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if self.read_inputs(cx) {
+            self.begin(fetch);
+            let index = if fetch { self.fetch_index } else { self.search_index };
+            if self.drafts[index].key.is_empty() { self.inputs.as_ref().expect("search entity inputs").providers[index].key.update(cx, |input, cx| input.set_value("", window, cx)); }
+        }
+        cx.notify();
+    }
+}
+impl Drop for SearchSettings { fn drop(&mut self) { self.cancel_and_clear(); if let Some(job) = self.job.take() { let _ = job.thread.join(); } } }
 
 fn validate_url(raw: &str) -> Result<Url, String> {
     if raw.len() > 4096 { return Err("URL 不得超过 4096 字节".into()); }
@@ -389,13 +570,13 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join(FILE);
         std::fs::write(&path, b"broken").unwrap();
-        assert!(SearchSettings::new(&root).is_err());
+        assert!(SearchSettings::load(&root).is_err());
         assert_eq!(std::fs::read(&path).unwrap(), b"broken");
         let mut old = Stored::default();
         old.configs[0].keys.push(SavedKey::new("migration-secret").unwrap());
         lumakit_support::save_versioned(&path, 1, &old).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let mut settings = SearchSettings::new(&root).unwrap();
+        let mut settings = SearchSettings::load(&root).unwrap();
         assert_eq!(settings.stored.configs[0].keys[0].ciphertext, old.configs[0].keys[0].ciphertext);
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::write(&path, b"not used after import").unwrap();
@@ -403,11 +584,11 @@ mod tests {
         connection.execute_batch("CREATE TRIGGER reject_search_write BEFORE INSERT ON search_configs BEGIN SELECT RAISE(ABORT,'reject'); END;").unwrap();
         settings.drafts[0].endpoint = "https://changed.example".into();
         assert!(settings.save(0, None).is_err());
-        let restored = SearchSettings::new(&root).unwrap();
+        let restored = SearchSettings::load(&root).unwrap();
         assert_eq!(restored.stored.configs[0].endpoint, old.configs[0].endpoint);
         assert_eq!(restored.stored.configs[0].keys[0].open().unwrap().as_str(), "migration-secret");
         connection.execute_batch("DROP TRIGGER reject_search_write; DELETE FROM search_configs;").unwrap();
-        assert!(SearchSettings::new(&root).is_err());
+        assert!(SearchSettings::load(&root).is_err());
         drop(connection); drop(restored); drop(settings);
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -438,8 +619,8 @@ mod tests {
         let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); let endpoint = format!("http://{}", server.local_addr().unwrap());
         let worker = thread::spawn(move || { let (mut stream, _) = server.accept().unwrap(); stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap(); let mut request = Vec::new(); let mut chunk = [0; 4096]; loop { let n = stream.read(&mut chunk).unwrap(); request.extend_from_slice(&chunk[..n]); if request.windows(4).any(|x| x == b"\r\n\r\n") { break; } } let text = String::from_utf8_lossy(&request).to_ascii_lowercase(); assert!(text.starts_with("post /search ")); assert!(text.contains("authorization: bearer local-test-key")); let body = r#"{"results":[{"title":"真实回环","url":"https://example.org/Private/A","content":"本地 HTTP 响应"}]}"#; write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).unwrap(); });
         let root = std::env::temp_dir().join(format!("lumadesk-search-{}", lumakit_support::new_id().unwrap()));
-        let mut settings = SearchSettings::new(&root).unwrap(); settings.drafts[0].endpoint = endpoint; settings.drafts[0].key = "local-test-key".into(); settings.save(0, None).unwrap();
-        let restored = SearchSettings::new(&root).unwrap(); assert_eq!(restored.stored.configs[0].keys[0].open().unwrap().as_str(), "local-test-key"); assert!(restored.stored.configs[4].keys.is_empty());
+        let mut settings = SearchSettings::load(&root).unwrap(); settings.drafts[0].endpoint = endpoint; settings.drafts[0].key = "local-test-key".into(); settings.save(0, None).unwrap();
+        let restored = SearchSettings::load(&root).unwrap(); assert_eq!(restored.stored.configs[0].keys[0].open().unwrap().as_str(), "local-test-key"); assert!(restored.stored.configs[4].keys.is_empty());
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap(); let result = rt.block_on(search_query(restored.stored.configs[0].clone(), "本地查询".into(), restored.preferences.clone(), CancellationToken::new())).unwrap(); assert_eq!(result.hits[0].title, "真实回环"); worker.join().unwrap();
         assert!(!std::fs::read(root.join("settings.db")).unwrap().windows(b"local-test-key".len()).any(|bytes| bytes == b"local-test-key")); drop(restored); drop(settings); std::fs::remove_dir_all(root).unwrap();
     }

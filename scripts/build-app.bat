@@ -20,6 +20,6 @@ if errorlevel 1 exit /b 1
 echo [3/3] Verifying published artifacts...
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0release-artifacts.ps1" -Verify
 if errorlevel 1 exit /b 1
-echo Run: %CD%\dist\LumaDesk\LumaDesk.exe
-echo Packages: %CD%\dist\installer\ ^(exact path in dist\release.json^)
+echo Run: %CD%\dist\LumaDesk-GPUI\LumaDesk-GPUI.exe
+echo Packages: %CD%\dist\gpui\installer\ ^(exact path in dist\gpui\release.json^)
 exit /b 0

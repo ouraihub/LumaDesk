@@ -32,9 +32,15 @@ shift
 goto collect
 
 :dispatch
+if /i "%SUBCOMMAND%"=="--help" goto cargo_global
+if /i "%SUBCOMMAND%"=="--version" goto cargo_global
 if defined HAS_MANIFEST (
   cargo %SUBCOMMAND%%ARGS%
 ) else (
   cargo %SUBCOMMAND% --manifest-path "%MANIFEST%"%ARGS%
 )
+exit /b %ERRORLEVEL%
+
+:cargo_global
+cargo %SUBCOMMAND%%ARGS%
 exit /b %ERRORLEVEL%

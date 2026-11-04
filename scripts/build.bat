@@ -14,4 +14,4 @@ if errorlevel 1 exit /b 1
 call "%~dp0cargo-msvc.bat" build --release
 if errorlevel 1 exit /b 1
 echo Built: %CD%\target\release\luma-desk.exe
-echo Package with scripts\build-app.bat; output goes to dist\LumaDesk\ and dist\installer\.
+echo Package with scripts\build-app.bat; output goes to dist\LumaDesk-GPUI\ and dist\gpui\installer\.

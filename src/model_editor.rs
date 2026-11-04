@@ -1,10 +1,12 @@
-//! 仅绘制模型字段；弹窗、滚动区域和保存操作由调用方管理。
+//! Typed model editor; saving and the surrounding dialog belong to ModelSettings.
 use std::{collections::BTreeMap, fmt::Display, str::FromStr};
-use eframe::egui;
+use gpui_kit::{div, prelude::*, ClipboardItem, Context, Entity, IntoElement, Render, Subscription, Window};
+use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState}, Disableable, Selectable, Sizable};
+use lumakit_design::{LumaTheme, Roles};
+use lumakit_design::components::label;
+use lumakit_design::metrics::{radius, space, text as styles};
 use lumakit_ai::{Protocol, catalog::ModelEntry, model_config::{ModelType, ReasoningConfig, ReasoningDialect, ReasoningEffort, ModelPricing, PriceTier}};
-use crate::theme::tokens as t;
 
-/// 每次打开模型时新建状态，包括重新打开尚未保存的模型，避免草稿串用。
 #[derive(Default)]
 pub(crate) struct EditorState {
     text: BTreeMap<String, String>,
@@ -21,76 +23,13 @@ impl EditorState {
                 let Some(rest) = key.strip_prefix("pricing.") else { return Some((key, value)); };
                 let (index, field) = rest.split_once('.')?;
                 let index: usize = index.parse().ok()?;
-                if index == removed { None }
-                else { Some((format!("pricing.{}.{}", if index > removed { index - 1 } else { index }, field), value)) }
+                if index == removed { None } else { Some((format!("pricing.{}.{}", if index > removed { index - 1 } else { index }, field), value)) }
             }).collect();
         }
-        shift(&mut self.text, removed);
-        shift(&mut self.errors, removed);
-        self.text.remove("pricing.0.start");
-        self.errors.remove("pricing.0.start");
+        shift(&mut self.text, removed); shift(&mut self.errors, removed);
+        self.text.remove("pricing.0.start"); self.errors.remove("pricing.0.start");
     }
 }
-
-fn error(ui: &mut egui::Ui, message: &str) {
-    ui.colored_label(ui.visuals().error_fg_color, message);
-}
-
-fn chip(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
-    let text = egui::RichText::new(label).color(if selected { ui.visuals().hyperlink_color } else { ui.visuals().text_color() });
-    let mut button = egui::Button::new(text).corner_radius(t::RADIUS);
-    if selected {
-        button = button.fill(ui.visuals().hyperlink_color.gamma_multiply(0.10))
-            .stroke(egui::Stroke::new(1.0, ui.visuals().hyperlink_color));
-    }
-    let response = ui.add(button);
-    response.widget_info(|| egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label));
-    response.on_hover_text(label)
-}
-
-fn optional_text(ui: &mut egui::Ui, label: &str, value: &mut Option<String>, hint: &str) {
-    let id = ui.label(label).id;
-    let text = value.get_or_insert_with(String::new);
-    ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY).hint_text(hint)).labelled_by(id);
-    if value.as_ref().is_some_and(|s| s.trim().chars().count() > 80) {
-        error(ui, &format!("{label}不能超过 80 个字符"));
-    }
-}
-
-fn number<T: Copy + Display + FromStr>(ui: &mut egui::Ui, state: &mut EditorState, key: &str,
-    label: &str, value: &mut Option<T>, required: bool, valid: impl Fn(T) -> bool) {
-    let label_id = ui.label(label).id;
-    let text = state.text.entry(key.into()).or_insert_with(|| value.map(|v| v.to_string()).unwrap_or_default());
-    ui.add(egui::TextEdit::singleline(text).desired_width(f32::INFINITY).id_salt(key)).labelled_by(label_id);
-    let parsed = if text.trim().is_empty() && !required { Ok(None) }
-        else { text.trim().parse::<T>().ok().filter(|v| valid(*v)).map(Some).ok_or(()) };
-    match parsed {
-        Ok(next) => { *value = next; state.errors.remove(key); }
-        Err(()) => {
-            let message = format!("{label}：请输入有效{}数字", if required { "的必填" } else { "的非负" });
-            error(ui, &message);
-            state.errors.insert(key.into(), message);
-        }
-    }
-}
-
-fn tokens(ui: &mut egui::Ui, state: &mut EditorState, key: &str, label: &str,
-    value: &mut Option<u32>, presets: &[(&str, u32)]) {
-    ui.horizontal_wrapped(|ui| {
-        for &(name, preset) in presets {
-            if chip(ui, *value == Some(preset), name).clicked() {
-                *value = Some(preset);
-                state.text.insert(key.into(), preset.to_string());
-                state.errors.remove(key);
-            }
-        }
-        if ui.button("清空").on_hover_text(format!("清空{label}")).clicked() {
-            *value = None; state.text.insert(key.into(), String::new()); state.errors.remove(key);
-        }
-    });
-    number(ui, state, key, label, value, false, |v| v > 0);
-}
-
 fn fits(dialect: ReasoningDialect, protocol: Protocol) -> bool {
     match dialect {
         ReasoningDialect::AnthropicBudget | ReasoningDialect::AnthropicAdaptive => protocol == Protocol::AnthropicMessages,
@@ -98,227 +37,211 @@ fn fits(dialect: ReasoningDialect, protocol: Protocol) -> bool {
         _ => protocol == Protocol::OpenAiChat,
     }
 }
-fn auto(dialect: ReasoningDialect) -> bool {
-    matches!(dialect, ReasoningDialect::ThinkingType | ReasoningDialect::Qwen)
-}
+fn auto(dialect: ReasoningDialect) -> bool { matches!(dialect, ReasoningDialect::ThinkingType | ReasoningDialect::Qwen) }
 fn reasoning(dialect: ReasoningDialect) -> ReasoningConfig {
-    ReasoningConfig {
-        dialect,
-        efforts: if auto(dialect) { vec![ReasoningEffort::None, ReasoningEffort::Auto] }
-            else { vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High] },
-        budget_tokens: if dialect == ReasoningDialect::AnthropicBudget { Some(1024) } else { None },
-    }
+    ReasoningConfig { dialect, efforts: if auto(dialect) { vec![ReasoningEffort::None, ReasoningEffort::Auto] }
+        else { vec![ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High] },
+        budget_tokens: if dialect == ReasoningDialect::AnthropicBudget { Some(1024) } else { None } }
 }
 fn set_type(value: &mut ModelEntry, kind: ModelType, state: &mut EditorState) {
     if value.settings.model_type == kind { return; }
     value.settings.model_type = kind;
     if kind != ModelType::Chat {
-        value.settings.reasoning = None;
-        value.settings.native_web_search = false;
-        value.settings.pricing = None;
-        value.settings.supports_tools = None;
+        value.settings.reasoning = None; value.settings.native_web_search = false;
+        value.settings.pricing = None; value.settings.supports_tools = None;
         state.clear("reasoning"); state.clear("pricing");
     }
 }
-fn tier(start: u32) -> PriceTier {
-    PriceTier { min_input_tokens: start, input: 0.0, output: 0.0, cache_read: None, cache_write: None }
-}
+fn tier(start: u32) -> PriceTier { PriceTier { min_input_tokens: start, input: 0.0, output: 0.0, cache_read: None, cache_write: None } }
+pub(crate) const MODEL_TYPES: [ModelType; 8] = [ModelType::Chat, ModelType::Image, ModelType::Embedding, ModelType::Rerank, ModelType::Video, ModelType::Tts, ModelType::Stt, ModelType::Unknown];
 
-pub(crate) fn fields(ui: &mut egui::Ui, value: &mut ModelEntry, protocol: Protocol,
-    existing: bool, state: &mut EditorState) -> Result<(), String> {
-    ui.spacing_mut().item_spacing.y = t::SPACE_SM;
-    let label = ui.label("模型 ID").id;
-    ui.horizontal(|ui| {
-        let width = (ui.available_width() - if existing { t::CONTROL_SMALL + t::SPACE_SM } else { 0.0 }).max(t::CONTROL);
-        ui.add_sized([width, ui.spacing().interact_size.y], egui::TextEdit::singleline(&mut value.id).interactive(!existing)).labelled_by(label);
-        if existing && ui.button(egui::RichText::new("\u{E1CA}").size(t::TITLE))
-            .on_hover_text("复制模型 ID").accessible_name("复制模型 ID").clicked() {
-            ui.ctx().copy_text(value.id.clone());
-        }
-    });
-    if value.id.trim().is_empty() { error(ui, "模型 ID 不能为空"); }
-    optional_text(ui, "模型名称", &mut value.settings.name, &value.id);
-    optional_text(ui, "分组名称", &mut value.settings.group_name,
-        value.id.split(['-', '/', ':']).next().unwrap_or_default());
-    if matches!(value.settings.model_type, ModelType::Chat | ModelType::Image) {
-        let label = ui.label("用途").id;
-        ui.horizontal_wrapped(|ui| {
-            for (name, kind, vision) in [("对话", ModelType::Chat, false), ("图像生成", ModelType::Image, false), ("图像编辑", ModelType::Image, true)] {
-                let selected = value.settings.model_type == kind && (kind == ModelType::Chat || value.capabilities.vision == vision);
-                if ui.radio(selected, name).labelled_by(label).clicked() {
-                    set_type(value, kind, state);
-                    if kind == ModelType::Image { value.capabilities.vision = vision; }
-                }
-            }
-        });
+pub(crate) struct ModelEditor {
+    pub value: ModelEntry,
+    protocol: Protocol,
+    existing: bool,
+    state: EditorState,
+    inputs: BTreeMap<String, (Entity<InputState>, Subscription)>,
+    more: bool,
+}
+impl ModelEditor {
+    pub fn new(value: ModelEntry, protocol: Protocol, existing: bool, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let mut this = Self { value, protocol, existing, state: EditorState::default(), inputs: BTreeMap::new(), more: true };
+        this.prepare_inputs(window, cx); this
     }
-    egui::CollapsingHeader::new("更多设置").default_open(true).show(ui, |ui| {
-        let label = ui.label("模型类型").id;
-        ui.horizontal_wrapped(|ui| {
-            for kind in [ModelType::Chat, ModelType::Image, ModelType::Embedding, ModelType::Rerank] {
-                if chip(ui, value.settings.model_type == kind, kind.label()).labelled_by(label).clicked() {
-                    set_type(value, kind, state);
+    pub fn validate(&self) -> Result<(), String> {
+        let id = self.value.id.trim();
+        if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) { return Err("模型 ID 须为 1–512 字节且不含控制字符".into()); }
+        if let Some(error) = self.state.errors.values().next() { return Err(error.clone()); }
+        self.value.settings.validate(self.protocol)
+    }
+    fn prepare_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let mut values = vec![("id".into(), self.value.id.clone()), ("name".into(), self.value.settings.name.clone().unwrap_or_default()),
+            ("group".into(), self.value.settings.group_name.clone().unwrap_or_default()),
+            ("context".into(), text(self.value.settings.context_window)), ("output".into(), text(self.value.settings.max_output))];
+        if let Some(reasoning) = &self.value.settings.reasoning { values.push(("reasoning.budget".into(), text(reasoning.budget_tokens))); }
+        if let Some(pricing) = &self.value.settings.pricing {
+            for (index, price) in pricing.tiers.iter().enumerate() {
+                for (field, value) in [("start", price.min_input_tokens.to_string()), ("input", price.input.to_string()), ("output", price.output.to_string()), ("read", text(price.cache_read)), ("write", text(price.cache_write))] {
+                    values.push((format!("pricing.{index}.{field}"), value));
                 }
             }
-            egui::ComboBox::from_id_salt("other_model_type").selected_text(
-                if matches!(value.settings.model_type, ModelType::Video | ModelType::Tts | ModelType::Stt | ModelType::Unknown) { value.settings.model_type.label() } else { "其它" }
-            ).show_ui(ui, |ui| {
-                for kind in [ModelType::Video, ModelType::Tts, ModelType::Stt, ModelType::Unknown] {
-                    if ui.selectable_label(value.settings.model_type == kind, kind.label()).labelled_by(label).clicked() { set_type(value, kind, state); }
-                }
-            }).response.labelled_by(label);
-        });
-        if value.settings.model_type == ModelType::Chat {
-            ui.label("模型能力");
-            ui.horizontal_wrapped(|ui| {
-                let enabled = value.settings.reasoning.is_some();
-                if chip(ui, enabled, "推理").clicked() {
-                    state.clear("reasoning");
-                    value.settings.reasoning = (!enabled).then(|| reasoning(if protocol == Protocol::AnthropicMessages { ReasoningDialect::AnthropicBudget } else { ReasoningDialect::OpenAi }));
-                }
-                let tools = value.settings.supports_tools;
-                if chip(ui, tools == Some(true), if tools.is_none() { "工具 · 未探测" } else if tools == Some(false) { "工具 · 不支持" } else { "工具" }).clicked() {
-                    value.settings.supports_tools = match tools { None => Some(true), Some(true) => Some(false), Some(false) => None };
-                    value.capabilities.tools = value.settings.supports_tools == Some(true);
-                }
-                if protocol != Protocol::OpenAiChat && chip(ui, value.settings.native_web_search, "联网").clicked() {
-                    value.settings.native_web_search = !value.settings.native_web_search;
+        }
+        self.inputs.retain(|key, _| values.iter().any(|(name, _)| name == key));
+        for (key, initial) in values {
+            if self.inputs.contains_key(&key) { continue; }
+            let initial = self.state.text.entry(key.clone()).or_insert(initial).clone();
+            let input = cx.new(|cx| InputState::new(window, cx).default_value(initial));
+            let name = key.clone();
+            let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    let value = input.read(cx).value().to_string();
+                    this.apply_text(&name, value); cx.notify();
                 }
             });
-            if let Some(config) = &mut value.settings.reasoning {
-                let label = ui.label("推理方言").id;
-                ui.horizontal_wrapped(|ui| {
-                    for (dialect, name) in [(ReasoningDialect::OpenAi, "OpenAI"), (ReasoningDialect::AnthropicBudget, "Anthropic 预算"), (ReasoningDialect::AnthropicAdaptive, "Anthropic 自适应"), (ReasoningDialect::ThinkingType, "Thinking type"), (ReasoningDialect::Qwen, "Qwen")] {
-                        if fits(dialect, protocol) && ui.selectable_label(config.dialect == dialect, name).labelled_by(label).clicked() {
-                            *config = reasoning(dialect); state.clear("reasoning");
-                        }
-                    }
-                });
-                let label = ui.label("允许的推理强度（至少一项）").id;
-                ui.horizontal_wrapped(|ui| {
-                    for (effort, name) in [(ReasoningEffort::None, "none"), (ReasoningEffort::Auto, "auto"), (ReasoningEffort::Minimal, "minimal"), (ReasoningEffort::Low, "low"), (ReasoningEffort::Medium, "medium"), (ReasoningEffort::High, "high"), (ReasoningEffort::Xhigh, "xhigh"), (ReasoningEffort::Max, "max")] {
-                        if effort == ReasoningEffort::Auto && !auto(config.dialect) { continue; }
-                        let mut selected = config.efforts.contains(&effort);
-                        if ui.checkbox(&mut selected, name).labelled_by(label).changed() {
-                            if selected { config.efforts.push(effort); } else { config.efforts.retain(|e| *e != effort); }
-                        }
-                    }
-                });
-                ui.weak("首项为默认推理强度；取消后重新勾选会移到末尾。");
-                if matches!(config.dialect, ReasoningDialect::AnthropicBudget | ReasoningDialect::Qwen) {
-                    let min = if config.dialect == ReasoningDialect::AnthropicBudget { 1024 } else { 1 };
-                    number(ui, state, "reasoning.budget", "推理 token 预算", &mut config.budget_tokens,
-                        config.dialect == ReasoningDialect::AnthropicBudget, |v| v >= min);
-                }
-            }
-            let label = ui.label("输入模态").id;
-            if chip(ui, value.capabilities.vision, "视觉输入").labelled_by(label).clicked() {
-                value.capabilities.vision = !value.capabilities.vision;
-            }
-            if protocol != Protocol::OpenAiChat { ui.small("联网由服务商原生搜索工具执行，可能产生额外费用。"); }
-            else if value.settings.native_web_search {
-                error(ui, "此协议不支持原生联网搜索，请关闭");
-                ui.checkbox(&mut value.settings.native_web_search, "原生联网搜索");
-            }
+            self.inputs.insert(key, (input, subscription));
         }
-        ui.checkbox(&mut value.capabilities.streaming, "支持流式输出");
-        value.settings.supports_streaming = value.capabilities.streaming;
-        ui.weak("流式声明保留；用于运行时选择流式或完整响应。");
-        tokens(ui, state, "context", "上下文窗口（token，留空为 32000）", &mut value.settings.context_window,
-            &[("128K", 128000), ("200K", 200000), ("256K", 262144), ("400K", 400000), ("512K", 524288), ("1M", 1000000)]);
-        tokens(ui, state, "output", "最大输出（token，留空为 4096）", &mut value.settings.max_output,
-            &[("16K", 16384), ("32K", 32768), ("64K", 65536), ("128K", 131072)]);
-        if value.settings.model_type == ModelType::Chat {
-            ui.separator();
-            ui.label("价格（每百万 token）");
-            let mut clear = false;
-            if let Some(pricing) = &mut value.settings.pricing {
-                let label = ui.label("币种").id;
-                ui.horizontal(|ui| {
-                    for currency in ["USD", "CNY"] {
-                        if ui.selectable_label(pricing.currency == currency, currency).labelled_by(label).clicked() { pricing.currency = currency.into(); }
-                    }
-                });
-                let mut remove = None;
-                for (index, price) in pricing.tiers.iter_mut().enumerate() {
-                    ui.push_id(index, |ui| {
-                        ui.group(|ui| {
-                            ui.horizontal(|ui| {
-                                ui.label(format!("第 {} 档", index + 1));
-                                if ui.button("删除此档").clicked() { remove = Some(index); }
-                            });
-                            let prefix = format!("pricing.{index}.");
-                            if index == 0 {
-                                let label = ui.label("起点（输入 token）").id;
-                                ui.add_enabled(false, egui::DragValue::new(&mut price.min_input_tokens)).labelled_by(label);
-                            } else {
-                                let mut start = Some(price.min_input_tokens);
-                                number(ui, state, &format!("{prefix}start"), "起点（输入 token）", &mut start, true, |_| true);
-                                if let Some(start) = start { price.min_input_tokens = start; }
-                            }
-                            for (key, label, target) in [("input", "输入价格", &mut price.input), ("output", "输出价格", &mut price.output)] {
-                                let mut amount = Some(*target);
-                                number(ui, state, &format!("{prefix}{key}"), label, &mut amount, true, |v: f64| v.is_finite() && (0.0..=1e6).contains(&v));
-                                if let Some(amount) = amount { *target = amount; }
-                            }
-                            for (key, label, target) in [("read", "缓存读取（留空同输入）", &mut price.cache_read), ("write", "缓存写入（留空同输入）", &mut price.cache_write)] {
-                                number(ui, state, &format!("{prefix}{key}"), label, target, false, |v: f64| v.is_finite() && (0.0..=1e6).contains(&v));
-                            }
-                        });
-                    });
-                }
-                if let Some(index) = remove {
-                    pricing.tiers.remove(index);
-                    if let Some(first) = pricing.tiers.first_mut() { first.min_input_tokens = 0; } else { clear = true; }
-                    state.remove_tier(index);
-                }
-                ui.horizontal(|ui| {
-                    let next = pricing.tiers.last().map_or(Some(0), |p| p.min_input_tokens.checked_add(200000));
-                    if ui.add_enabled(pricing.tiers.len() < 8 && next.is_some(), egui::Button::new("添加价格档")).clicked() {
-                        if let Some(next) = next { pricing.tiers.push(tier(next)); }
-                    }
-                    clear |= ui.button("清除价格").clicked();
-                });
-            } else if ui.button("添加价格").clicked() {
-                value.settings.pricing = Some(ModelPricing { currency: "USD".into(), tiers: vec![tier(0)] });
-                state.clear("pricing");
+    }
+    fn reset(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.clear(prefix); self.inputs.retain(|key, _| !key.starts_with(prefix)); self.prepare_inputs(window, cx);
+    }
+    fn apply_text(&mut self, key: &str, value: String) {
+        self.state.text.insert(key.into(), value.clone());
+        self.state.errors.remove(key);
+        let result = match key {
+            "id" => { if !self.existing { self.value.id = value; } Ok(()) },
+            "name" => { self.value.settings.name = (!value.trim().is_empty()).then_some(value); Ok(()) },
+            "group" => { self.value.settings.group_name = (!value.trim().is_empty()).then_some(value); Ok(()) },
+            "context" => parse(&value, &mut self.value.settings.context_window, false, |v| v > 0),
+            "output" => parse(&value, &mut self.value.settings.max_output, false, |v| v > 0),
+            "reasoning.budget" => if let Some(config) = &mut self.value.settings.reasoning {
+                let required = config.dialect == ReasoningDialect::AnthropicBudget;
+                parse(&value, &mut config.budget_tokens, required, |v| v >= if required { 1024 } else { 1 })
+            } else { Ok(()) },
+            _ => {
+                let result = key.strip_prefix("pricing.").and_then(|s| s.split_once('.')).and_then(|(index, field)| index.parse::<usize>().ok().map(|index| (index, field)));
+                if let Some((index, field)) = result {
+                    if let Some(price) = self.value.settings.pricing.as_mut().and_then(|p| p.tiers.get_mut(index)) {
+                        match field {
+                            "start" => { let mut target = Some(price.min_input_tokens); let result = parse(&value, &mut target, true, |_| true); if let Some(v) = target { price.min_input_tokens = v; } result },
+                            "input" | "output" => { let target = if field == "input" { &mut price.input } else { &mut price.output }; let mut amount = Some(*target); let result = parse(&value, &mut amount, true, valid_price); if let Some(v) = amount { *target = v; } result },
+                            "read" => parse(&value, &mut price.cache_read, false, valid_price),
+                            "write" => parse(&value, &mut price.cache_write, false, valid_price),
+                            _ => Ok(()),
+                        }
+                    } else { Ok(()) }
+                } else { Ok(()) }
             }
-            if clear { value.settings.pricing = None; state.clear("pricing"); }
+        };
+        if result.is_err() { self.state.errors.insert(key.into(), format!("{key}：请输入有效数字（预算/容量为正整数，价格为 0–1000000）")); }
+    }
+    fn field(&self, key: &str, label: &str, disabled: bool) -> gpui_kit::Div {
+        div().flex().flex_col().gap(space::S4).child(group_label(label.to_owned())).child(Input::new(&self.inputs[key].0).disabled(disabled))
+    }
+    fn action(&self, id: impl Into<gpui_kit::ElementId>, label: impl Into<gpui_kit::SharedString>, selected: bool, cx: &Context<Self>, action: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static) -> Button {
+        Button::new(id).small().outline().label(label).selected(selected).on_click(cx.listener(move |this, _, window, cx| { action(this, window, cx); cx.notify(); }))
+    }
+    fn presets(&self, key: &'static str, values: &[(&'static str, u32)], cx: &Context<Self>) -> gpui_kit::Div {
+        let mut row = div().flex().flex_wrap().gap(space::S4);
+        for &(label, value) in values {
+            row = row.child(self.action(format!("{key}-{value}"), label, false, cx, move |this, window, cx| {
+                let text = value.to_string(); this.apply_text(key, text.clone());
+                this.inputs[key].0.update(cx, |input, cx| input.set_value(text, window, cx));
+            }));
         }
-    });
-    let id = value.id.trim();
-    let validation = if id.is_empty() || id.len() > 512 || id.chars().any(char::is_control) { Err("模型 ID 须为 1–512 字节且不含控制字符".into()) }
-        else if let Some(message) = state.errors.values().next() { Err(message.clone()) }
-        else { value.settings.validate(protocol) };
-    if let Err(message) = &validation { error(ui, message); }
-    validation
+        row.child(self.action(format!("{key}-clear"), "清空", false, cx, move |this, window, cx| {
+            this.apply_text(key, String::new()); this.inputs[key].0.update(cx, |input, cx| input.set_value("", window, cx));
+        }))
+    }
 }
-
+impl Render for ModelEditor {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let r: Roles = LumaTheme::global(cx).roles;
+        let mut body = div().flex().flex_col().gap(space::S12).w_full()
+            .child(self.field("id", "模型 ID", self.existing))
+            .child(div().flex().child(self.action("copy-id", "复制模型 ID", false, cx, |this, _, cx| cx.write_to_clipboard(ClipboardItem::new_string(this.value.id.clone())))))
+            .child(self.field("name", "模型名称（留空使用 ID）", false)).child(self.field("group", "分组名称（留空自动分组）", false));
+        let mut usage = div().flex().flex_wrap().gap(space::S4);
+        for (label, kind, vision) in [("对话", ModelType::Chat, false), ("图像生成", ModelType::Image, false), ("图像编辑", ModelType::Image, true)] {
+            usage = usage.child(self.action(label, label, self.value.settings.model_type == kind && (kind == ModelType::Chat || self.value.capabilities.vision == vision), cx, move |this, window, cx| {
+                set_type(&mut this.value, kind, &mut this.state); if kind == ModelType::Image { this.value.capabilities.vision = vision; } this.prepare_inputs(window, cx);
+            }));
+        }
+        body = body.child(usage).child(div().flex().child(self.action("more", if self.more { "收起更多设置" } else { "更多设置" }, self.more, cx, |this, _, _| this.more = !this.more)));
+        if self.more {
+            let mut kinds = div().flex().flex_wrap().gap(space::S4);
+            for (index, kind) in MODEL_TYPES.into_iter().enumerate() {
+                kinds = kinds.child(self.action(("kind", index), kind.label(), self.value.settings.model_type == kind, cx, move |this, window, cx| { set_type(&mut this.value, kind, &mut this.state); this.prepare_inputs(window, cx); }));
+            }
+            body = body.child(group_label("模型类型")).child(kinds);
+            if self.value.settings.model_type == ModelType::Chat {
+                let tools = self.value.settings.supports_tools;
+                body = body.child(div().flex().flex_wrap().gap(space::S4)
+                    .child(self.action("reasoning", "推理", self.value.settings.reasoning.is_some(), cx, |this, window, cx| {
+                        this.value.settings.reasoning = if this.value.settings.reasoning.is_some() { None } else { Some(reasoning(if this.protocol == Protocol::AnthropicMessages { ReasoningDialect::AnthropicBudget } else { ReasoningDialect::OpenAi })) }; this.reset("reasoning", window, cx);
+                    }))
+                    .child(self.action("tools", match tools { None => "工具 · 未探测", Some(true) => "工具 · 支持", Some(false) => "工具 · 不支持" }, tools == Some(true), cx, |this, _, _| {
+                        this.value.settings.supports_tools = match this.value.settings.supports_tools { None => Some(true), Some(true) => Some(false), Some(false) => None }; this.value.capabilities.tools = this.value.settings.supports_tools == Some(true);
+                    }))
+                    .child(self.action("vision", "视觉输入", self.value.capabilities.vision, cx, |this, _, _| this.value.capabilities.vision = !this.value.capabilities.vision)));
+                if self.protocol != Protocol::OpenAiChat || self.value.settings.native_web_search {
+                    body = body.child(div().flex().child(self.action("web", "原生联网（可能产生额外费用）", self.value.settings.native_web_search, cx, |this, _, _| this.value.settings.native_web_search = !this.value.settings.native_web_search)));
+                }
+                if let Some(config) = &self.value.settings.reasoning {
+                    let mut dialects = div().flex().flex_wrap().gap(space::S4);
+                    for (index, (dialect, label)) in [(ReasoningDialect::OpenAi, "OpenAI"), (ReasoningDialect::AnthropicBudget, "Anthropic 预算"), (ReasoningDialect::AnthropicAdaptive, "Anthropic 自适应"), (ReasoningDialect::ThinkingType, "Thinking type"), (ReasoningDialect::Qwen, "Qwen")].into_iter().enumerate() {
+                        if fits(dialect, self.protocol) { dialects = dialects.child(self.action(("dialect", index), label, config.dialect == dialect, cx, move |this, window, cx| { this.value.settings.reasoning = Some(reasoning(dialect)); this.reset("reasoning", window, cx); })); }
+                    }
+                    let mut efforts = div().flex().flex_wrap().gap(space::S4);
+                    for (index, (effort, label)) in [(ReasoningEffort::None, "none"), (ReasoningEffort::Auto, "auto"), (ReasoningEffort::Minimal, "minimal"), (ReasoningEffort::Low, "low"), (ReasoningEffort::Medium, "medium"), (ReasoningEffort::High, "high"), (ReasoningEffort::Xhigh, "xhigh"), (ReasoningEffort::Max, "max")].into_iter().enumerate() {
+                        if effort == ReasoningEffort::Auto && !auto(config.dialect) { continue; }
+                        efforts = efforts.child(self.action(("effort", index), label, config.efforts.contains(&effort), cx, move |this, _, _| { if let Some(config) = &mut this.value.settings.reasoning { if config.efforts.contains(&effort) { config.efforts.retain(|e| *e != effort); } else { config.efforts.push(effort); } } }));
+                    }
+                    body = body.child(group_label("推理方言")).child(dialects).child(group_label("允许的推理强度（至少一项；首项为默认，重新选择移到末尾）")).child(efforts);
+                    if matches!(config.dialect, ReasoningDialect::AnthropicBudget | ReasoningDialect::Qwen) { body = body.child(self.field("reasoning.budget", "推理 token 预算", false)); }
+                }
+            }
+            body = body.child(div().flex().child(self.action("streaming", "支持流式输出", self.value.capabilities.streaming, cx, |this, _, _| { this.value.capabilities.streaming = !this.value.capabilities.streaming; this.value.settings.supports_streaming = this.value.capabilities.streaming; })))
+                .child(self.field("context", "上下文窗口（token，留空为 32000）", false))
+                .child(self.presets("context", &[("128K", 128000), ("200K", 200000), ("256K", 262144), ("400K", 400000), ("512K", 524288), ("1M", 1000000)], cx))
+                .child(self.field("output", "最大输出（token，留空为 4096）", false))
+                .child(self.presets("output", &[("16K", 16384), ("32K", 32768), ("64K", 65536), ("128K", 131072)], cx));
+            if self.value.settings.model_type == ModelType::Chat {
+                body = body.child(group_label("价格（每百万 token）"));
+                if let Some(pricing) = &self.value.settings.pricing {
+                    let mut currencies = div().flex().gap(space::S4);
+                    for currency in ["USD", "CNY"] { currencies = currencies.child(self.action(currency, currency, pricing.currency == currency, cx, move |this, _, _| { if let Some(pricing) = &mut this.value.settings.pricing { pricing.currency = currency.into(); } })); }
+                    body = body.child(currencies);
+                    for (index, _) in pricing.tiers.iter().enumerate() {
+                        let mut row = div().flex().flex_col().gap(space::S8).p(space::S12).border_1().border_color(r.border_muted).rounded(radius::MD).child(group_label(format!("第 {} 档", index + 1)));
+                        for (field, label) in [("start", "起点（输入 token）"), ("input", "输入价格"), ("output", "输出价格"), ("read", "缓存读取（留空同输入）"), ("write", "缓存写入（留空同输入）")] { row = row.child(self.field(&format!("pricing.{index}.{field}"), label, index == 0 && field == "start")); }
+                        row = row.child(div().flex().justify_end().child(self.action(("remove-tier", index), "删除此档", false, cx, move |this, window, cx| {
+                            if let Some(pricing) = &mut this.value.settings.pricing { pricing.tiers.remove(index); if let Some(first) = pricing.tiers.first_mut() { first.min_input_tokens = 0; } else { this.value.settings.pricing = None; } }
+                            this.state.remove_tier(index); this.inputs.retain(|key, _| !key.starts_with("pricing.")); this.prepare_inputs(window, cx);
+                        }).danger())); body = body.child(row);
+                    }
+                    let next = pricing.tiers.last().map_or(Some(0), |p| p.min_input_tokens.checked_add(200000));
+                    body = body.child(div().flex().gap(space::S4).child(self.action("add-tier", "添加价格档", false, cx, move |this, window, cx| {
+                        if let (Some(pricing), Some(next)) = (&mut this.value.settings.pricing, next) { if pricing.tiers.len() < 8 { pricing.tiers.push(tier(next)); } } this.prepare_inputs(window, cx);
+                    }).disabled(pricing.tiers.len() >= 8 || next.is_none()))
+                    .child(self.action("clear-price", "清除价格", false, cx, |this, window, cx| { this.value.settings.pricing = None; this.reset("pricing", window, cx); })));
+                } else { body = body.child(div().flex().child(self.action("add-price", "添加价格", false, cx, |this, window, cx| { this.value.settings.pricing = Some(ModelPricing { currency: "USD".into(), tiers: vec![tier(0)] }); this.reset("pricing", window, cx); }))); }
+            }
+        }
+        if let Err(error) = self.validate() { body = body.child(label(styles::METADATA, error).text_color(r.feedback_error)); }
+        body
+    }
+}
+/// Label over an option set or input inside the editor.
+fn group_label(content: impl Into<gpui_kit::SharedString>) -> gpui_kit::Div { label(styles::TITLE_COMPACT, content) }
+fn text<T: Display>(value: Option<T>) -> String { value.map(|v| v.to_string()).unwrap_or_default() }
+fn valid_price(value: f64) -> bool { value.is_finite() && (0.0..=1e6).contains(&value) }
+fn parse<T: Copy + FromStr>(text: &str, target: &mut Option<T>, required: bool, valid: impl Fn(T) -> bool) -> Result<(), ()> {
+    let value = if text.trim().is_empty() && !required { None } else { Some(text.trim().parse::<T>().ok().filter(|v| valid(*v)).ok_or(())?) };
+    *target = value; Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn chip_keyboard_activation_and_disabled_state() {
-        let ctx = egui::Context::default();
-        let mut selected = false;
-        let mut draw = |events, enabled| {
-            let mut response = None;
-            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
-                response = Some(ui.add_enabled_ui(enabled, |ui| chip(ui, selected, "视觉输入")).inner);
-            });
-            output.textures_delta.clear();
-            let response = response.unwrap();
-            if response.clicked() { selected = !selected; }
-            (response.id, selected)
-        };
-        let (id, _) = draw(vec![], true);
-        ctx.memory_mut(|memory| memory.request_focus(id));
-        let event = |pressed| egui::Event::Key { key: egui::Key::Space, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE };
-        assert!(draw(vec![event(true)], true).1);
-        draw(vec![event(false)], true);
-        assert!(draw(vec![event(true)], false).1);
-    }
-
     #[test]
     fn reasoning_defaults_fit_protocol_and_budget() {
         assert!(fits(ReasoningDialect::OpenAi, Protocol::OpenAiChat));
@@ -326,11 +249,14 @@ mod tests {
         assert!(!fits(ReasoningDialect::Qwen, Protocol::OpenAiResponses));
         assert_eq!(reasoning(ReasoningDialect::AnthropicBudget).budget_tokens, Some(1024));
         let mut state = EditorState::default();
-        state.text.insert("pricing.1.input".into(), "invalid".into());
-        state.errors.insert("pricing.1.input".into(), "invalid".into());
-        state.remove_tier(0);
-        assert_eq!(state.text.get("pricing.0.input").map(String::as_str), Some("invalid"));
-        assert!(state.errors.contains_key("pricing.0.input"));
-        assert!(reasoning(ReasoningDialect::Qwen).efforts.contains(&ReasoningEffort::Auto));
+        state.text.insert("pricing.1.input".into(), "invalid".into()); state.errors.insert("pricing.1.input".into(), "invalid".into());
+        state.remove_tier(0); assert_eq!(state.text.get("pricing.0.input").map(String::as_str), Some("invalid"));
+        assert!(state.errors.contains_key("pricing.0.input")); assert!(reasoning(ReasoningDialect::Qwen).efforts.contains(&ReasoningEffort::Auto));
+    }
+    #[test]
+    fn invalid_numeric_draft_preserves_saved_value() {
+        let mut price = Some(2.0); assert!(parse("NaN", &mut price, true, valid_price).is_err()); assert_eq!(price, Some(2.0));
+        assert!(parse("", &mut price, false, valid_price).is_ok()); assert_eq!(price, None);
+        let mut tokens = Some(1024_u32); assert!(parse("-1", &mut tokens, true, |v| v >= 1024).is_err()); assert_eq!(tokens, Some(1024));
     }
 }
