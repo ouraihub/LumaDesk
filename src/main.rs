@@ -7,6 +7,7 @@ mod model_editor;
 mod search_settings;
 mod settings_store;
 mod mcp_settings;
+mod usage_settings;
 mod theme;
 
 use gpui_kit::{*, prelude::FluentBuilder as _};
@@ -30,13 +31,14 @@ fn app_icon(app: usize) -> IconName {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TabKind { Launchpad, App(usize) }
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SettingsPage { Models, Search, Mcp, Appearance }
+enum SettingsPage { Models, Search, Mcp, Usage, Appearance }
 /// Settings navigation groups, ThinkRail-style: (section, [(page, icon, title, search terms)]).
 const SETTINGS: [(&str, &[(SettingsPage, IconName, &str, &str)]); 2] = [
     ("AI", &[
         (SettingsPage::Models, IconName::KeyRound, "模型服务", "provider api 密钥 协议 模型 ai"),
         (SettingsPage::Search, IconName::Globe, "网络搜索", "search fetch 网页 黑名单 密钥 ai"),
         (SettingsPage::Mcp, IconName::Plug, "MCP 工具", "mcp 工具 tool server 信任 skills"),
+        (SettingsPage::Usage, IconName::ScrollText, "用量统计", "usage token cost 用量 费用 统计 ai"),
     ]),
     ("界面", &[
         (SettingsPage::Appearance, IconName::Palette, "外观", "appearance theme 主题 强调色 背景 密度 浅色 深色 系统"),
@@ -51,6 +53,7 @@ struct DesktopApp {
     mcp: Entity<mcp_settings::McpSettings>,
     appearance: Entity<theme::Appearance>,
     chat: chat::ChatState,
+    usage: usage_settings::UsageSettings,
     panel: Entity<ChatPanel>,
     tabs: Vec<TabKind>,
     active: usize,
@@ -81,19 +84,27 @@ impl DesktopApp {
         let models = model_settings::ModelSettings::create(&root, window, cx)?;
         let search = search_settings::SearchSettings::create(&root, window, cx)?;
         let mcp = mcp_settings::McpSettings::create(&root, window, cx)?;
-        let chat = chat::ChatState::new(&root)?;
+        let mut chat = chat::ChatState::new(&root)?;
+        chat.reconcile_models(models.read(cx));
         let panel = cx.new(|cx| ChatPanel::new(window, cx));
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置"));
         let app = cx.new(|cx: &mut Context<Self>| {
             let subscriptions = vec![
                 cx.subscribe_in(&panel, window, |this, _, action: &ChatAction, window, cx| {
-                    let open_settings = this.chat.dispatch(action.clone(), this.models.read(cx));
-                    if open_settings { this.open_settings(SettingsPage::Models, window, cx); }
+                    if let ChatAction::RefreshModels { force } = action {
+                        this.models.update(cx, |models, cx| { models.refresh_catalog(*force); cx.notify(); });
+                    } else {
+                        let open_settings = this.chat.dispatch(action.clone(), this.models.read(cx));
+                        if open_settings { this.open_settings(SettingsPage::Models, window, cx); }
+                    }
                     this.ensure_background(window, cx);
                     cx.notify();
                 }),
                 cx.observe(&panel, |_, _, cx| cx.notify()),
-                cx.observe_in(&models, window, |this, _, window, cx| { this.ensure_background(window, cx); cx.notify(); }),
+                cx.observe_in(&models, window, |this, _, window, cx| {
+                    this.chat.reconcile_models(this.models.read(cx));
+                    this.ensure_background(window, cx); cx.notify();
+                }),
                 cx.observe_in(&search, window, |this, _, window, cx| { this.ensure_background(window, cx); cx.notify(); }),
                 cx.observe(&appearance, |_, _, cx| cx.notify()),
                 cx.subscribe(&query, |_, _, _: &InputEvent, cx| cx.notify()),
@@ -103,6 +114,7 @@ impl DesktopApp {
                 }),
             ];
             Self { _data_lock: data_lock, _logs: logs, models, search, mcp, appearance, chat, panel,
+                usage: usage_settings::UsageSettings::default(),
                 tabs: vec![TabKind::Launchpad], active: 0, settings: None, settings_query: query,
                 _subscriptions: subscriptions, background: None }
         });
@@ -155,6 +167,7 @@ impl DesktopApp {
     fn open_settings(&mut self, page: SettingsPage, window: &mut Window, cx: &mut Context<Self>) {
         self.leave_settings(window, cx);
         self.settings = Some(page);
+        if page == SettingsPage::Usage { self.refresh_usage(); }
         cx.notify();
     }
     fn launchpad(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -219,8 +232,15 @@ impl Render for DesktopApp {
                 if !narrow { nav = nav.child(ui::nav_section(*group, !found, &r)); }
                 found = true;
                 for (item, (target, icon, title, _)) in matches.into_iter().enumerate() {
-                    nav = nav.child(ui::nav_item(("settings-page", section * 10 + item), icon, title, page == target, &r,
-                        cx.listener(move |this, _, window, cx| this.open_settings(target, window, cx))));
+                    nav = nav.child(if target == SettingsPage::Usage {
+                        Button::new("settings-usage").small().ghost().icon(icon).label(title)
+                            .accessibility_label("AI 设置：用量统计").selected(page == target).toggled(page == target)
+                            .when(!narrow, |button| button.w_full())
+                            .on_click(cx.listener(move |this, _, window, cx| this.open_settings(target, window, cx))).into_any_element()
+                    } else {
+                        ui::nav_item(("settings-page", section * 10 + item), icon, title, page == target, &r,
+                            cx.listener(move |this, _, window, cx| this.open_settings(target, window, cx)))
+                    });
                 }
             }
             if !found { nav = nav.child(label(text::METADATA, "没有匹配的设置项").text_color(r.text_subtle).py(space::S4)); }
@@ -228,6 +248,7 @@ impl Render for DesktopApp {
                 SettingsPage::Models => self.models.clone().into_any_element(),
                 SettingsPage::Search => self.search.clone().into_any_element(),
                 SettingsPage::Mcp => self.mcp.clone().into_any_element(),
+                SettingsPage::Usage => self.usage_page(cx),
                 SettingsPage::Appearance => self.appearance.clone().into_any_element(),
             };
             (if narrow { ui::stacked(nav, page_view) } else { ui::shell(nav, page_view) }).into_any_element()
@@ -237,6 +258,7 @@ impl Render for DesktopApp {
                     let panel = self.panel.clone();
                     self.models.update(cx, |models, cx| panel.update(cx, |panel, cx| {
                         panel.set_external_busy(self.chat.picking());
+                        panel.set_model_refresh_state(models.refreshing_catalog(), models.catalog_refresh_notice().to_owned());
                         let metadata = self.chat.session.history().model.as_ref().and_then(|model| models.model_settings(model));
                         panel.render_session(&self.chat.session, models.available_models(), models.image_models(), metadata, window, cx)
                     }))

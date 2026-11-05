@@ -42,6 +42,8 @@ dist\gpui\release.json                      版本、包路径与 SHA-256
 
 ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换文件，不枚举、复制或删除数据目录；`powershell -NoProfile -File scripts\release-artifacts.ps1 -Verify` 可单独复核。不会覆盖旧的 egui 正式产物 `dist\LumaDesk\`。
 
+发布脚本显式按 UTF-8 解码 Cargo metadata，避免 Windows PowerShell 在中文仓库路径中生成乱码产物路径；模型目录的 OMP MIT 许可同时写入 `THIRD-PARTY.txt`。验证新版界面必须确认运行路径和发布哈希，不在编译尚未完成时启动旧 target EXE。
+
 ## 数据目录
 
 默认是 EXE 旁的 `data-gpui\`；`LUMADESK_DATA_DIR` 显式指定时优先。验证或截图请用临时目录，不要指向正式资料。同一目录有文件锁，不能同时开两个写入实例。

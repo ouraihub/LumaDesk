@@ -144,3 +144,81 @@ LumaDesk 做得好的：颜色集中在 `theme.rs` 且有对比度测试；滚�
 - 职责拆分：`lumakit-gpui/src/chat.rs` 保留聊天主体，`chat/overlays.rs` 负责菜单/编辑层，`chat/toolbar.rs` 负责工具列表和自定义；三个生产文件均小于 500 行。
 - 实窗验证（debug、隔离目录）：开关即时改变底栏且自定义页保持打开；上下键排序、拖动附件至第一项、正常关闭应用并重启后排序保留；恢复默认、Esc 和点击外部关闭通过。320/375/414/768 宽度均检查截图，浮层无横向裁切。
 - 测试：既有工具栏持久化回归覆盖顺序、去重、跨会话/重启、未知项、旧默认及保存失败回滚；lumakit-design 47 项、宿主 25 项通过。未测试完整读屏软件和生成中实窗；本次未提交或更新正式分发包。
+
+## 8. AutoNote 网络搜索页对标（2026-11-04）
+
+- 依据：`dev/AutoNote/packages/app/src/features/ai/settings/SearchSection.svelte` 实际使用已安装 `aether-ui 0.1.1` 的 `SearchSettings.svelte`、`SearchProviderCard.svelte`、`SearchAdvancedTools.svelte` 与 `settings-flow.ts`。读取了供应商请求/响应合同；本地使用 GPUI/reqwest 独立实现，不复制 Svelte/CSS 或上游资源。
+- 界面：网页搜索、读取网页两张卡片；左侧标题/说明/官网入口、右侧服务商选择；密钥输入旁为管理与检测图标；卡片展示脱敏摘要，密钥增删改/显示/复制放入独立模态窗口；基础地址带复制；保存位于卡片左下。高级设置折叠，数值/压缩横向布局，手动查询与读取另卡展示。窄窗头部主动换行。
+- 供应商：搜索支持智谱、Tavily、SearXNG、Exa、Exa MCP、博查、Querit、Brave、Parallel、Jina、Firecrawl；读取支持 Jina、Querit、Firecrawl、直接获取。SearXNG 支持可选 Basic 用户名和加密密码；Exa MCP 支持 JSON-RPC 与 SSE。不是只增加菜单名称。
+- 保存：切换默认项独立提交，不保存地址/密钥草稿；卡片仅保存自身配置；密钥管理仅提交密钥；高级设置独立保存。检测先保存当前卡片，再使用固定查询 `web search` 或读取 `https://example.com`；手动工具只使用已保存配置，不隐式保存草稿。写入失败保留草稿与原密文，检测失败不撤销已成功保存的配置。
+- 存储：沿用 settings.db 表结构，Basic 用户名单独存入已有 prefs 的 `search.usernames`；旧五项目录扩展新增配置时保持原默认项、稳定顺序和密文。搜索/读取的 Jina、Querit、Firecrawl 分别保存，不共享凭据。现有 URL 限制、响应大小限制、取消及仅 401/403/429 密钥轮换保持不变。
+- 模块：`search_settings.rs` 负责状态与任务协调；catalog/stored/persistence/inputs、network/policy/parsing、view/providers/keys/advanced 和 tests 分职责，所有生产文件在 500 行以内。
+- 验证：宿主 33 项测试通过（含 10 项配置/存储/请求回归、3 项供应商矩阵）；11 搜索与 4 读取使用本机 HTTP 回环验证请求、认证和结果；MCP 覆盖多结果/段落、JSON/SSE、错误脱敏；图标资源定向测试通过。debug 实窗检查 11/4 选择菜单、密钥添加/修改/显示/删除与取消、关闭/Esc、基础地址复制、检测成功与 HTTP 401 失败、320/375/414/768 宽度。
+- 差异与边界：仍沿用宿主主题与设置导航；默认项保留原 Tavily/Jina，不强制改成上游 Exa MCP；密钥删除保留确认步骤。网络任务仍为单请求互斥，不宣称支持同时检测多卡。没有复制上游“优先模型原生工具”开关：当前搜索设置没有接入该聊天路由消费者。保留不跟随重定向等本地安全策略。未使用真实供应商凭据验证公网服务、未测试完整读屏软件；本轮未提交或发布新分发包。
+
+## 9. 生图入口可达性与实窗验证（2026-11-04）
+
+- 结论：底层已有真实 `generate_image` 工具与 OpenAI 兼容 `/images/generations` 请求，不是空按钮。原入口在未选图片模型时禁用，提示却只有“生图”，且图片模型配置入口隐藏在＋菜单，导致用户无法判断前置条件。
+- 对照 AutoNote 已安装的 `ChatPanelToolbar.svelte` 与宿主 `AiSection.svelte`：生图依赖绘图模型和聊天模型工具能力；缺配置/不支持工具需明确提示。LumaDesk 保留每个对话的图片模型快照，不改为 AutoNote 的全局绘图角色；最小原生适配为点击生图直接打开图片模型选择器，没有可用图片模型时提供模型设置入口。无有效聊天模型或明确不支持工具时，不允许从选择器启用生图。
+- 工具栏提示现在区分缺聊天模型、缺图片模型和不支持工具；＋中的图片模型选择入口始终可达。固定生图图标时不再重复显示可移除生图标签。选择图片模型后仍通过聊天工具调用，不把生图变成独占聊天模式。
+- 实窗发现并修复预览越过容器压到正文：图片和容器都有明确尺寸及裁剪；图片使用 Kit Button，具名且提供键盘/UIA 激活入口。
+- 验证：现有七项 `painting_` 回环测试通过，涵盖真实图片请求/历史/重试快照、工具不支持、错误与不安全 URL、调用上限、取消、Responses 后续对话。隔离模型目录与本地 HTTP 上游实窗跑通：固定生图图标→未配置时选择模型→聊天发出 generate_image→图片接口收到请求→有效 PNG 内联预览→正常退出重启后图片仍显示；UIA 读到 240×220 预览且具备 InvokePattern。空目录场景可进入模型设置，没有伪造成功。
+- 边界：没有使用用户真实密钥或公网生图服务；本次未增加图片编辑接口，未改现有 4 MiB/HTTPS 下载等安全限制。此前网络搜索变更与本节代码尚未提交、未重新打包。
+
+## 10. ThinkRail 模型与强度组合选择器（2026-11-04）
+
+- 参考是 `E:/workspace/notepad-dev/thinkrail/apps/web/src/chat/ModelEffortPicker.tsx`、`ModelEffortLabel.tsx`、`modelPicker.ts`、`pickerGroups.ts`、`useModelPreferences.ts` 和 `ChatView.tsx`，不是 ThinkRail Native 的旧双选择器。GPUI 使用宿主令牌独立实现，无浏览器依赖。
+- 一个紧凑入口显示供应商首字母、模型名、强度条/文字、已保存密钥标记及箭头。360px 锚定浮层包含搜索、固定、最近使用、可折叠供应商分组、两行模型项；模型、端点、服务商和协议组成完整身份。价格/上下文只显示真实配置，没有的认证类型、订阅或价格不编造。
+- 点击新模型立即应用并保持打开，悬停不切换；再次选当前模型、Esc、外部点击关闭。支持模糊匹配及 `beta high` 后回车同时选择模型和支持的强度；上下键导航模型，键盘高亮可滚动到可见项。列表独立滚动，不带旧菜单的关闭页脚。
+- 强度位于模型列表下面，跟随当前模型；离散滑杆使用原生 Kit 行为与冷暖轨道、携带档位文字的滑块，支持拖动/点击与左右键。提供档位点击、默认强度标记、恢复默认和超高/最大开销提示。没有推理配置的模型不显示强度区。Auto 是单独的自动控制，不当作比 Max 更高的档位；本地继承默认和明确关闭保持区别。
+- 收藏/最近/默认组合写入 chat.db 现有 composer 元数据，旧记录用默认空偏好；最近唯一完整身份最多十项。模型/强度/最近记录原子提交，失败回滚；收藏及默认变更不清草稿或执行请求。显式新对话用默认组合，首次输入物化对话保留待用选择，已有对话切换恢复模型；不会改变已发请求和重试来源。
+- 打开浮层仅重读本地已保存目录；强制刷新使用有界 HTTP 请求读取每条启用线路的模型目录，成功只新增，保留已有类型和手工配置；失败线路不删除模型、不把错误伪装成刷新成功。刷新状态与部分失败在浮层显示。独立 egui 示例宿主只支持其环境配置的本地重读，明确提示没有 HTTP 发现能力。
+- 验证：核心模型选择器 12 项回归通过，覆盖重启、完整身份、组合/收藏/默认写入失败回滚、不兼容强度、首次输入与新对话区别、草稿/附件与已发快照。LumaKit workspace 全套与宿主35项测试通过；宿主新增本地重载/真实HTTP刷新测试，覆盖部分失败和元数据保留。Clippy 执行完成但仍有既有模型设置/搜索测试等告警，未宣称零告警。
+- 实窗（debug、隔离目录、本地可控模型目录）：选模型不关闭、左右键调档、拖动至超高、档位恢复、固定、最近、默认、新对话应用、`beta high`+Enter、无推理模型、真实刷新及失败线路提示、320/375/414/768宽度、退出重启后偏好恢复、外部点击/Esc/当前模型关闭均通过。
+- 原生适配边界：供应商用首字母标记而非上游品牌SVG，价格/认证仅展示本地实际配置，默认强度标记优先保存的组合否则模型配置首项。未验收触屏与完整读屏软件。前面的搜索、生图与本节修改均尚未提交，未更新dist分发包；真实用户数据未改动。
+
+## 11. OMP 用量统计与模型元数据（2026-11-04）
+
+- 在现有 Rust 请求/SQLite 链路移植统计合同，不引入 Bun 或 Web 仪表盘。逐请求保存稳定 ID、开始时间、耗时、实际模型、输入/输出/缓存/推理和价格来源；输入包含缓存，推理属于输出子集，不重复相加。
+- chat.db schema 5 独立账本按请求 ID 去重，复制/分支不增加真实消耗，删除聊天保留已记录账本；无用量/无价格保持未知，不补造取消或失败请求的账单。历史记录无时间/身份时标覆盖限制，无法追溯过去历史副本，时间筛选排除无日期请求。
+- 精确模型 ID/规范提供方前缀从内置 OMP MIT 目录补全上下文、可表示的参考价格及协议兼容推理；手配优先，未知/歧义/不支持费率仍未知。GPT-6.1-sol 支持来源 low/medium/high/xhigh/max，不再因未手配 reasoning 隐藏已有滑杆；显式停用和恢复自动可保存。参考价格是估值，不是中转账单。
+- 用量入口保留弹层而不新增常驻状态栏：提示词上下文估算、当前对话累计、折叠的上一回答；设置增加全局统计，按全部/7天/30天与模型/服务商/UTC天分组。上下文锚点需模型和实际请求前缀匹配，仅追加本地估算，不替代准入预算。
+- 验证：LumaKit workspace 161 项、宿主36项通过；真实回环请求确认选择 max 后发送 reasoning_effort=max，账本保存100输入/20输出/25缓存读取/5推理及 reference 金额0.0003525 USD。独立egui实窗用量弹层及320/375/414/768宽度已观察；GPUI新构建实窗已观察滑杆、用量弹层和全局范围/分组控件。
+- 纠正验收流程：最初误启动旧 target 产物、文件占用导致替换失败，不属于新界面缺失；后续只对明确路径的成功构建验收。发布脚本修复中文路径下 Cargo metadata 的 UTF-8 解码，并将 OMP MIT 声明纳入分发许可。
+
+## 12. Cherry 模型编辑分组（2026-11-04）
+
+- 读取 Cherry 本机 `ModelDrawer/EditModelDrawer.tsx`、ModelBasicFields、ModelPurposeFields、ModelClassificationControls、ModelContextWindowFields、ModelPricingFields 与 ProviderSettingsDrawer；按信息层级独立用 GPUI 实现，没有复制 React/CSS 或资源。
+- 紧凑单列、ID内联复制、名称/分组、更多设置下的类型/能力、输入模态、容量限制、流式及价格分组；标题和保存/取消固定，表单独立滚动。用途最初按参考使用卡片，用户后续要求改为紧凑下拉，说明仅显示选中项。保留现有原子保存/取消，不照搬自动保存。
+- 最大输入 Token 已接入请求前预算与正整数/窗口关系校验；手工覆盖清空恢复自动。推理显示自动来源而不把未修改推断值保存为覆盖；无运行消费者的图像编辑、音频/视频明确不可用。
+- 实窗已验证名称修改取消不落盘、保存名称/输入上限生效而推断reasoning/context/pricing仍未写成覆盖；预设200K/400K及自动清空生效。320/375/414/768宽度下固定保存/取消均在窗口内，内容滚动后页脚不动。完整读屏软件及公网供应商未验收。
+
+### 推理能力与使用参数分离
+
+Cherry `ModelSpeedControl.tsx` 从模型能力派生可用档位，选择持久化到助手/会话；`shared/ai/reasoning.ts` 单独加入 default，`reasoningSerializers.ts` 按服务商 wire profile 解释 default/none/auto/具体档位。ThinkRail `ModelEffortPicker.tsx` 由 onSelectLevel 处理聊天使用参数，并非模型编辑表单。
+
+按用户纠正，模型页不再编辑推理档位、默认强度、协议方言或预算，只保留能力分类。聊天里的“默认”是独立状态，不自动选支持列表第一档 low；未显式指定则不发强度参数，具体档位由使用时选择。已有保存能力数据保留，不将缺配置伪造成关闭。用途继续使用用户已确认的紧凑下拉，其他编辑分组按最新 Cherry 截图收敛。
+
+最终修正实窗：全新隔离配置下 `gpt-6.1-sol` 滑杆读到“默认”，首次回环请求不含 reasoning/reasoning_effort；点击 max 后下一次真实 HTTP 请求含 reasoning_effort=max；点击默认恢复不指定档位。编辑页仅显示推理能力，不再有推理参数输入或方言/档位选择表单。定向后端99项、宿主35项通过；之前完整 workspace 验证仍记录于上文。
+
+发布完成：`dist/LumaDesk-GPUI/LumaDesk-GPUI.exe` 与便携包 `0.1.0-6160c615e7864d01b319592e03662096` 已生成，`release-artifacts.ps1 -Verify` 核对 EXE/ZIP/包内EXE 哈希通过；实际启动该 dist 路径，模型编辑入口、用途下拉及无推理参数表单已复核。只使用隔离目录与本地回环服务，未修改真实用户数据。
+
+## 13. 模型能力图标与统一元数据（2026-11-04）
+
+- Cherry `ModelTagsWithLabel.tsx` → `ModelTag.tsx` 按 capabilities/inputModalities 选择标签；AutoNote/Aether `EndpointModels.svelte` 使用 canVision、reasoning、supportsTools，筛选与图标共用谓词。原设置列表仅读原始手工值且渲染文字标签，聊天选择器无能力图标，导致自动识别未贯通。
+- 新 `ModelEntry::effective_settings(protocol)` 在设置列表、能力筛选、聊天选项和请求解析共用；精确参考 input:image 补全视觉，明确工具声明补全工具。GPT-6 Sol/6.1 Sol/6 Astra 的源目录均声明 image 输入、freeform patch 与 computer-use 工具支持；未知模型不点亮。显式 supports_tools=false、vision_override=false 优先，旧true配置保留，推断不写回用户覆盖。
+- 共享 `lumakit_gpui::model_capability_badges` 渲染眼睛/大脑/扳手/联网图标、主题色背景、工具提示和可访问名称；设置列表与聊天模型选择器复用。编辑页各按钮补 Type/Image/Boxes/ArrowUpDown/Brain/Wrench/Eye/Ear/Video 图标，资源由 UiAssets 注册，分组标题严格为“模型类型、模型能力、输入模态”。
+- 验证：目录元数据8项、运行目录解析3项、图标资源1项及宿主35项通过。隔离配置下三种GPT模型各显示视觉/推理/工具三图标，unknown-model无图标；手工关闭GPT-6.1-sol视觉并保存后只该行眼睛消失，聊天选择器同步只显示剩余两项。320/375/414/768宽度能力图标均在窗口内；未使用真实凭据。
+- 已发布 `dist/LumaDesk-GPUI/LumaDesk-GPUI.exe`，便携包构建标识 `0.1.0-099ab4b0faf043399f5ea09cb01eacb3`；发布哈希校验通过，实窗使用的确为该dist路径。
+
+## 14. Cherry 可编辑能力与 ThinkRail 力度刻度
+
+- 纠正只读能力误解：Cherry 的 ModelClassificationControls 通过按钮切换 capabilities/inputModalities 集合，能力声明可编辑，不等同于聊天请求强度。本地推理、工具、视觉、音频、视频均可点击切换并原子保存/取消；推理能力声明与可发送的协议/档位独立，未知模型声明推理不会凭空生成 wire 参数。明确关闭优先于目录，列表/选择器图标同步反映声明。
+- 实窗点击五个能力控件均可用；取消后原数据未改，保存后数据库读回推理/工具/视觉false、音频/视频true，随后重新启用已知能力，聊天选择器同步显示。音频/视频仅为模型元数据，目前未接入上传链路，界面明确说明。
+- ThinkRail `ModelEffortPicker` 只绘制宿主 `thinkingLevels`，由固定依赖 pi-ai1.5.0 的 getSupportedThinkingLevels 过滤。其官方GPT-6.1-sol thinkingLevelMap中off/minimal为null，故不能把其他中转截图的关闭/最低强塞到官方模型。对齐中文关闭/最低/低/中/高/极高/最高、分档图标及提示，标题“力度 · 模型名”；默认恢复移出刻度行，具体支持档位保持模型真实合同。
+- 宿主36项（含能力覆盖与序列化回归）通过，实窗确认能力点击、保存/取消及力度刻度/恢复默认分离。发布时不关闭用户实例、不读改用户数据；Windows映射旧EXE时用无备份原子替换，避免删除占用旧备份导致发布清单未提交。
+
+### ThinkRail 档位核对补充
+
+- ThinkRail 直接传输 host 的 `thinkingLevels`，不是前端自行列出所有档位；`toWireModel` 调用 `getSupportedThinkingLevels`，官方 Pi 规则按 `thinkingLevelMap` 过滤。截图对应的实际有效列表是 `off / minimal / low / medium / high`，显示为“关闭 / 最低 / 低 / 中 / 高”。
+- 本地 GPT-6.1 Sol 的 OMP 公开目录仍保留 xhigh/max 参考档位，但当前 ThinkRail 对标线路按上述五档展示；请求参数映射保持 off/minimal/low/medium/high 原值，默认仍不发送显式档位。UI 测试必须核对可访问标签和实际列表，不只看滑杆视觉。

@@ -14,6 +14,8 @@ fn display_name_and_model_type_change_picker_without_changing_wire_id() {
     assert_eq!(file.providers[0].endpoints[0].models[0].settings.group_name("wire-chat"), "自定义分组");
     let images = model_options_for(&file, ModelType::Image);
     assert_eq!(images.iter().map(|option| option.model.model.as_str()).collect::<Vec<_>>(), ["image-model"]);
+    assert_eq!(options[0].settings.group_name.as_deref(), Some("自定义分组"));
+    assert!(!options[0].has_key);
 }
 
 #[cfg(windows)]
@@ -195,6 +197,8 @@ fn actual_loopback_detection_auth_failover_and_encrypted_reload() {
     assert!(settings.available_models().is_empty());
     settings.save().unwrap();
     assert_eq!(settings.available_models().len(), 1);
+    assert!(settings.available_models()[0].has_key);
+    assert!(!format!("{:?}", settings.available_models()[0]).contains("first-key"));
     assert_eq!(settings.connection(&selected).unwrap().api_key.unwrap().as_str(), "first-key");
     settings.draft.providers.last_mut().unwrap().enabled = false;
     settings.save().unwrap();
@@ -273,4 +277,63 @@ fn unauthorized_without_saved_key_says_save_the_key_first() {
     let error = detect_models(&endpoint, CancellationToken::new()).unwrap_err();
     assert!(error.contains("没有已保存的密钥") && error.contains("401"), "{error}");
     assert!(!server.join().unwrap().to_ascii_lowercase().contains("authorization:"));
+}
+
+#[test]
+fn picker_local_refresh_reloads_store_without_committing_draft() {
+    let root = std::env::temp_dir().join(format!("lumadesk-picker-local-{}", new_id().unwrap()));
+    let mut settings = ModelSettings::load(&root).unwrap();
+    settings.draft.providers[0].endpoints[0].base_url = "unfinished address".into(); settings.dirty = true;
+    let mut saved = settings.saved.clone(); saved.providers[0].enabled = true;
+    saved.providers[0].endpoints[0].models.push(ModelEntry { id: "local-new".into(), capabilities: unknown_capabilities(), manual: true, settings: Default::default() });
+    settings.store.save(&saved.providers, saved.presets_initialized).unwrap();
+    settings.refresh_catalog(false);
+    assert!(!settings.refreshing_catalog());
+    assert_eq!(settings.available_models()[0].model.model, "local-new");
+    assert_eq!(settings.draft.providers[0].endpoints[0].base_url, "unfinished address");
+    assert!(settings.dirty);
+    drop(settings); std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn picker_force_refresh_uses_http_and_preserves_failed_catalog_and_manual_metadata() {
+    use std::io::{Read, Write};
+    let root = std::env::temp_dir().join(format!("lumadesk-picker-http-{}", new_id().unwrap()));
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap(); let address = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut paths = Vec::new();
+        for (status, body) in [("200 OK", r#"{"data":[{"id":"manual-image"},{"id":"new-chat"},{"id":"gpt-image-2"}]}"#), ("503 Unavailable", "{}") ] {
+            let (mut socket, _) = listener.accept().unwrap(); socket.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+            let mut request = Vec::new();
+            loop { let mut chunk = [0u8; 2048]; let size = socket.read(&mut chunk).unwrap(); request.extend_from_slice(&chunk[..size]); if size == 0 || request.windows(4).any(|w| w == b"\r\n\r\n") { break; } }
+            paths.push(String::from_utf8(request).unwrap());
+            write!(socket, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+        }
+        paths
+    });
+    let mut settings = ModelSettings::load(&root).unwrap();
+    settings.draft.providers.truncate(1);
+    let provider = &mut settings.draft.providers[0]; provider.enabled = true;
+    let endpoint = &mut provider.endpoints[0]; endpoint.base_url = format!("http://{address}/good");
+    endpoint.models.push(ModelEntry { id: "manual-image".into(), capabilities: ModelCapabilities { streaming: true, tools: true, vision: true }, manual: true,
+        settings: lumakit_ai::model_config::ModelSettings { name: Some("保留聊天类型".into()), group_name: Some("自定义".into()), ..Default::default() } });
+    endpoint.models.push(ModelEntry { id: "absent-remains".into(), capabilities: unknown_capabilities(), manual: false, settings: Default::default() });
+    let mut failed = endpoint.clone(); failed.id = new_id().unwrap(); failed.name = "失败线路".into(); failed.base_url = format!("http://{address}/failed");
+    let original_failed = serde_json::to_value(&failed).unwrap();
+    provider.endpoints.push(failed); settings.save().unwrap();
+    let original_manual = serde_json::to_value(&settings.saved.providers[0].endpoints[0].models[0]).unwrap();
+    settings.refresh_catalog(true); assert!(settings.refreshing_catalog());
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while settings.refreshing_catalog() { assert!(std::time::Instant::now() < deadline); settings.poll(); std::thread::sleep(Duration::from_millis(5)); }
+    let paths = server.join().unwrap(); assert!(paths[0].starts_with("GET /good/models ")); assert!(paths[1].starts_with("GET /failed/models "));
+    assert!(paths.iter().all(|request| !request.to_ascii_lowercase().contains("authorization:")));
+    let endpoints = &settings.saved.providers[0].endpoints;
+    assert_eq!(serde_json::to_value(&endpoints[0].models[0]).unwrap(), original_manual);
+    assert_eq!(serde_json::to_value(&endpoints[1]).unwrap(), original_failed);
+    assert!(endpoints[0].models.iter().any(|model| model.id == "absent-remains"));
+    assert!(settings.available_models().iter().any(|option| option.model.model == "new-chat"));
+    assert!(settings.image_models().iter().any(|option| option.model.model == "gpt-image-2"));
+    assert!(settings.sync_dialog.is_none()); assert!(settings.catalog_refresh_notice().contains("[catalog_endpoint]"));
+    let restored = ModelSettings::load(&root).unwrap(); assert!(restored.available_models().iter().any(|option| option.model.model == "new-chat"));
+    drop(restored); drop(settings); std::fs::remove_dir_all(root).unwrap();
 }

@@ -28,10 +28,7 @@ impl ModelSettings {
                     .child(ui::field("协议", v_flex().gap(space::S8).child(protocols).child(ui::request_line(request, &r)), &r));
                 if let Some(id) = id { let id = id.clone(); destructive = Some(self.button("delete-endpoint", "删除线路…", cx, move |this, window, cx| { this.delete_endpoint = Some(id.clone()); this.close_editor(window, cx); }).danger()); }
             }
-            EditorDialog::Model { .. } => {
-                if let Some(model) = &self.view.as_ref().unwrap().model { body = body.child(model.clone()); }
-                body = body.child(hint("保存后从下一次调用生效；正在生成的回复不受影响。", &r));
-            }
+            EditorDialog::Model { .. } => return self.model_editor_view(cx),
             EditorDialog::Keys { provider, endpoint } => {
                 if let Some(p) = self.draft.providers.iter().position(|p| p.id == *provider) { if let Some(e) = self.draft.providers[p].endpoints.iter().position(|e| e.id == *endpoint) {
                     let keys = &self.draft.providers[p].endpoints[e].keys;
@@ -51,6 +48,23 @@ impl ModelSettings {
             .child(self.button("close-editor", if keys { "完成" } else { "取消" }, cx, |this, window, cx| this.close_editor(window, cx)).outline());
         if !keys { footer = footer.child(self.button("save-editor", "保存", cx, |this, window, cx| this.save_editor(window, cx)).primary()); }
         body.child(footer)
+    }
+    /// Only the form scrolls: title, dismissal, save and errors remain reachable at narrow widths.
+    fn model_editor_view(&self, cx: &Context<Self>) -> gpui_kit::Div {
+        let r = roles(cx);
+        let close = self.on(Button::new("model-editor-close").small().ghost().icon(IconName::X)
+            .accessibility_label("关闭模型设置，不保存").tooltip("关闭，不保存"), cx, |this, window, cx| this.close_editor(window, cx));
+        let model = self.view.as_ref().and_then(|view| view.model.clone());
+        v_flex().size_full().min_h_0().min_w_0()
+            .child(h_flex().flex_none().gap(space::S8).p(space::S12).border_b_1().border_color(r.border_muted)
+                .child(dialog_title("模型设置")).child(div().flex_1()).child(close))
+            .child(v_flex().id("model-editor-body").flex_1().min_h_0().min_w_0().gap(space::S12).p(space::S12).overflow_y_scrollbar()
+                .children(model).child(hint("保存后从下一次调用生效；正在生成的回复不受影响。", &r)))
+            .child(v_flex().flex_none().min_w_0().gap(space::S8).p(space::S12).border_t_1().border_color(r.border_muted)
+                .children(self.status(cx))
+                .child(h_flex().justify_end().gap(space::S8)
+                    .child(self.button("close-editor", "取消", cx, |this, window, cx| this.close_editor(window, cx)).outline())
+                    .child(self.button("save-editor", "保存", cx, |this, window, cx| this.save_editor(window, cx)).primary())))
     }
     /// Delete confirmation: what goes away, a quiet cancel and a destructive confirm.
     pub(super) fn delete_view(&self, cx: &Context<Self>) -> gpui_kit::Div {

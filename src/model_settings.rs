@@ -2,6 +2,7 @@
 use lumakit_support::secrets::{SavedKey, new_id};
 use gpui_kit::{App, Context, Entity, Window};
 mod view;
+mod catalog_refresh;
 use futures_util::StreamExt;
 use lumakit_ai::{AiConnection, Protocol};
 use lumakit_ai::providers::ModelCapabilities;
@@ -99,6 +100,8 @@ pub struct ModelSettings {
     delete_key: Option<(String, String, String)>,
     sync_dialog: Option<SyncDialog>,
     job: Option<Job>,
+    catalog_refresh: Option<catalog_refresh::CatalogRefreshJob>,
+    catalog_refresh_notice: String,
     provider_filter: u8,
     model_query: String,
     capability_filter: u8,
@@ -123,6 +126,7 @@ impl ModelSettings {
             search: String::new(), key_drafts: HashMap::new(),
             notice: String::new(), error: false, dirty: false,
             delete_provider: None, delete_endpoint: None, delete_key: None, sync_dialog: None, job: None,
+            catalog_refresh: None, catalog_refresh_notice: String::new(),
             provider_filter: 0, model_query: String::new(), capability_filter: 0, folded: HashSet::new(), editor: None,
             view: None,
         };
@@ -168,6 +172,8 @@ impl ModelSettings {
         saved.keys.clone_from(&endpoint.keys);
         saved.selected_key.clone_from(&endpoint.selected_key);
         self.catalog = ModelCatalog::new(self.saved.providers.clone());
+        self.options = model_options(&self.saved);
+        self.image_options = model_options_for(&self.saved, ModelType::Image);
         Ok(())
     }
     fn commit(&mut self) { let result = self.save(); self.report(result, "已保存"); }
@@ -306,6 +312,7 @@ impl ModelSettings {
         self.notice = "正在获取模型列表…".into(); self.error = false;
     }
     pub fn poll(&mut self) -> bool {
+        let catalog_changed = self.poll_catalog_refresh();
         let result = self.job.as_ref().and_then(|job| match job.rx.try_recv() { Ok(result) => Some(result), Err(mpsc::TryRecvError::Disconnected) => Some(Err("模型请求线程异常结束，请重试".into())), Err(mpsc::TryRecvError::Empty) => None });
         if let Some(result) = result {
             let job = self.job.take().unwrap();
@@ -327,7 +334,7 @@ impl ModelSettings {
             }
             return true;
         }
-        false
+        catalog_changed
     }
 
     fn clear_drafts(&mut self) {
@@ -348,7 +355,7 @@ impl ModelSettings {
     pub fn connection(&self, model: &lumakit_ai::ModelRef) -> Result<AiConnection, String> { self.catalog.resolve(model) }
 }
 impl Drop for ModelSettings {
-    fn drop(&mut self) { self.clear_drafts(); if let Some(job) = self.job.take() { let _ = job.thread.join(); } }
+    fn drop(&mut self) { self.cancel_catalog_refresh(); self.clear_drafts(); if let Some(job) = self.job.take() { let _ = job.thread.join(); } }
 }
 
 
@@ -387,6 +394,7 @@ fn model_options_for(file: &SettingsFile, kind: ModelType) -> Vec<ModelOption> {
     file.providers.iter().filter(|p| p.enabled).flat_map(|p| p.endpoints.iter().flat_map(move |e| e.models.iter().filter(move |m| m.settings.model_type == kind).map(move |m| ModelOption {
         model: lumakit_ai::ModelRef { provider: p.id.clone(), endpoint: e.id.clone(), model: m.id.clone(), protocol: e.protocol },
         name: m.settings.display_name(&m.id).to_owned(), provider: p.name.clone(), endpoint: e.name.clone(),
+        settings: m.effective_settings(e.protocol), has_key: e.keys.iter().any(|key| !key.ciphertext.is_empty()),
     }))).collect()
 }
 fn repair_model_selection(endpoint: &mut EndpointEntry) {

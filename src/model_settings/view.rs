@@ -4,7 +4,7 @@ use super::*;
 use gpui_kit::{div, prelude::*, px, AnyElement, ClipboardItem, ElementId, FocusHandle, IntoElement, Pixels, Render, Role, SharedString, Subscription};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState}, menu::{DropdownMenu, PopupMenuItem}, switch::Switch, tag::Tag, Disableable, FocusTrapElement, Icon, Selectable, Sizable};
+use gpui_kit::component::{button::{Button, ButtonVariants}, input::{Input, InputEvent, InputState}, menu::{DropdownMenu, PopupMenuItem}, switch::Switch, Disableable, FocusTrapElement, Icon, Selectable, Sizable};
 use crate::model_editor::{ModelEditor, MODEL_TYPES};
 use lumakit_design::{LumaTheme, Roles};
 use lumakit_design::components::{label, IconButton};
@@ -15,6 +15,8 @@ mod dialogs;
 
 /// Dialog column width (ThinkRail's wide form dialogs).
 const DIALOG_WIDTH: Pixels = px(640.);
+/// Cherry's model side panel uses a compact one-column form.
+const MODEL_EDITOR_WIDTH: Pixels = px(400.);
 /// The dialog layer is at least this tall, so a short page still frames the dialog.
 const DIALOG_MIN_HEIGHT: Pixels = px(560.);
 /// Window width above which the provider rail sits beside the detail (settings nav + rail + detail).
@@ -79,7 +81,7 @@ impl ModelSettings {
         self.view = Some(ModelView { inputs, _subscriptions: subscriptions, model: None, focus: cx.focus_handle(), modal_open: false, previous_focus: None });
         self.refresh_endpoint(window, cx);
     }
-    pub fn is_busy(&self) -> bool { self.job.is_some() }
+    pub fn is_busy(&self) -> bool { self.job.is_some() || self.refreshing_catalog() }
     pub fn clear_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.clear_drafts(); self.delete_provider = None; self.delete_endpoint = None;
         if let Some(view) = &mut self.view { view.model = None; view.modal_open = false; view.previous_focus = None; }
@@ -356,7 +358,8 @@ impl ModelSettings {
         let query = self.model_query.trim().to_lowercase(); let mut groups: Vec<(String, Vec<&ModelEntry>)> = Vec::new();
         for model in &endpoint.models {
             if !(model.id.to_lowercase().contains(&query) || model.settings.display_name(&model.id).to_lowercase().contains(&query)) { continue; }
-            if !match self.capability_filter { 1 => model.capabilities.vision, 2 => model.settings.reasoning.is_some(), 3 => model.settings.supports_tools.unwrap_or(model.capabilities.tools), 4 => model.settings.native_web_search, _ => true } { continue; }
+            let effective = model.effective_settings(endpoint.protocol);
+            if !match self.capability_filter { 1 => effective.supports_vision, 2 => effective.supports_reasoning(), 3 => effective.supports_tools == Some(true), 4 => effective.native_web_search, _ => true } { continue; }
             let group = model.settings.group_name(&model.id);
             if let Some((_, models)) = groups.iter_mut().find(|(key, _)| key == group) { models.push(model); } else { groups.push((group.into(), vec![model])); }
         }
@@ -409,17 +412,16 @@ impl ModelSettings {
         let endpoint = &self.draft.providers[p].endpoints[e];
         let selected = endpoint.selected_model.as_ref() == Some(&model.id);
         let name = model.settings.display_name(&model.id).to_owned(); let id = model.id.clone();
-        let tags: Vec<_> = [(model.capabilities.vision, "视觉"), (model.settings.reasoning.is_some(), "推理"), (model.settings.supports_tools.unwrap_or(model.capabilities.tools), "工具"), (model.settings.native_web_search, "联网")]
-            .into_iter().filter_map(|(on, title)| on.then(|| Tag::secondary().small().child(title))).collect();
+        let effective = model.effective_settings(endpoint.protocol);
         let select = h_flex().id(format!("select-model-{id}")).flex_1().min_w(px(0.)).gap(space::S8).cursor_pointer().role(Role::Button).aria_label(name.clone()).aria_selected(selected)
-            .child(label(text::UI, name).min_w(px(0.)).truncate()).children(tags)
-            .child(hint(format!("{} · {}", model.id, model.settings.model_type.label()), &r).min_w(px(0.)).truncate())
+            .child(label(text::UI, name).min_w(px(0.)).truncate().flex_1())
+            .child(lumakit_gpui::model_capability_badges(&effective, r))
             .on_click(cx.listener(move |this, _, _, cx| { this.edit_models(p, e, Some(id.clone()), &[]); cx.notify(); }));
         let value = model.clone(); let id = model.id.clone();
         h_flex().h(MODEL_ROW).px(space::S12).gap(space::S8).border_t_1().border_color(r.border_muted)
             .when(selected, |d| d.bg(r.control_bg_selected)).when(!selected, |d| d.hover(|s| s.bg(r.control_bg_hovered)))
             .child(select)
-            .child(self.icon(format!("edit-model-{id}"), IconName::Settings2, "模型设置", cx, move |this, window, cx| this.open_editor(EditorDialog::Model { provider: this.draft.providers[p].id.clone(), endpoint: this.draft.providers[p].endpoints[e].id.clone(), original: Some(value.id.clone()), value: value.clone() }, window, cx)))
+            .child(self.on(Button::new(format!("edit-model-{id}")).small().ghost().icon(IconName::Settings2).accessibility_label(format!("编辑模型 {id}")).tooltip("模型设置"), cx, move |this, window, cx| this.open_editor(EditorDialog::Model { provider: this.draft.providers[p].id.clone(), endpoint: this.draft.providers[p].endpoints[e].id.clone(), original: Some(value.id.clone()), value: value.clone() }, window, cx)))
             .child(self.icon(format!("remove-model-{id}"), IconName::Trash, "移除模型", cx, move |this, _, _| this.edit_models(p, e, None, std::slice::from_ref(&id))))
     }
     /// The page notice and, while an address is unsaved, the retry entry.
@@ -476,13 +478,16 @@ impl Render for ModelSettings {
         }
         let content = if self.delete_provider.is_some() || self.delete_endpoint.is_some() || self.delete_key.is_some() { self.delete_view(cx) }
             else if self.editor.is_some() { self.editor_view(cx) } else { self.sync_view(cx) };
-        let dialog = v_flex().id("model-settings").size_full().min_h(px(0.)).overflow_y_scroll().p(space::S24).gap(space::S16)
-            .track_focus(&focus).on_key_down(escape).child(content).children(self.status(cx));
+        let model_editor = matches!(self.editor, Some(EditorDialog::Model { .. }));
+        let dialog = v_flex().id("model-settings").size_full().min_h(px(0.))
+            .when(!model_editor, |d| d.overflow_y_scroll().p(space::S24).gap(space::S16))
+            .track_focus(&focus).on_key_down(escape).child(content)
+            .when(!model_editor, |d| d.children(self.status(cx)));
         // Keep the dialog bounded when adding models grows the background page.
         div().relative().w_full().h_full().min_h(DIALOG_MIN_HEIGHT).overflow_hidden()
             .child(v_flex().id("models-background").w_full().gap(space::S16).child(header).child(self.columns(wide, cx)))
             .child(div().absolute().inset_0().occlude().flex().justify_center().items_start().p(space::S12).bg(r.overlay)
-                .child(v_flex().w_full().max_w(DIALOG_WIDTH).h_full().min_h(px(0.)).rounded(radius::LG).border_1().border_color(r.border_default).bg(r.container_elevated_bg).shadow_lg()
+                .child(v_flex().w_full().max_w(if model_editor { MODEL_EDITOR_WIDTH } else { DIALOG_WIDTH }).h_full().min_h(px(0.)).rounded(radius::LG).border_1().border_color(r.border_default).bg(r.container_elevated_bg).shadow_lg()
                     .child(dialog.focus_trap("model-settings-dialog", &focus)))).into_any_element()
     }
 }

@@ -1,5 +1,7 @@
 param([switch]$Verify)
 $ErrorActionPreference = 'Stop'
+# Cargo emits UTF-8 JSON; Windows PowerShell otherwise decodes native stdout with the OEM code page.
+[Console]::OutputEncoding = New-Object Text.UTF8Encoding $false
 $root = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $dist = Join-Path $root 'dist/gpui'
 $portable = Join-Path $root 'dist/LumaDesk-GPUI'
@@ -73,6 +75,15 @@ try {
             [void]$text.AppendLine([IO.File]::ReadAllText($license.FullName))
         }
     }
+    $referencePath = Join-Path $root '../LumaKit/crates/lumakit-ai/src/model_reference.json'
+    # Windows PowerShell JSON objects are case-insensitive; model IDs are not. Decode only the license string.
+    $referenceJson = [IO.File]::ReadAllText($referencePath)
+    $licenseMatch = [regex]::Match($referenceJson, '"license"\s*:\s*("(?:\\.|[^"\\])*")')
+    if (!$licenseMatch.Success) { throw 'Bundled model catalog license is missing.' }
+    $referenceLicense = $licenseMatch.Groups[1].Value | ConvertFrom-Json
+    [void]$text.AppendLine("`n=== OMP bundled model reference catalog ===")
+    [void]$text.AppendLine('Source: https://github.com/can1357/oh-my-pi (revision and source SHA-256 embedded in the application catalog)')
+    [void]$text.AppendLine($referenceLicense)
     [IO.File]::WriteAllText($notices, $text.ToString(), (New-Object Text.UTF8Encoding $false))
     $zipName = 'LumaDesk-GPUI_' + $version + '_x64-portable.zip'
     $zip = Join-Path $stage $zipName
@@ -94,7 +105,7 @@ try {
     [IO.File]::WriteAllText($manifestTemp, ($manifest | ConvertTo-Json -Depth 5), (New-Object Text.UTF8Encoding $false))
     Move-Item -LiteralPath $stage -Destination $final
     # Replace files only: never enumerate, copy, or remove the portable data directory.
-    if (Test-Path -LiteralPath $exe) { [IO.File]::Replace($exeTemp, $exe, (Join-Path $final 'previous.exe')); Remove-Item -LiteralPath (Join-Path $final 'previous.exe') }
+    if (Test-Path -LiteralPath $exe) { [IO.File]::Replace($exeTemp, $exe, [NullString]::Value) }
     else { [IO.File]::Move($exeTemp, $exe) }
     Copy-Item -LiteralPath (Join-Path $final 'THIRD-PARTY.txt') -Destination (Join-Path $portable 'THIRD-PARTY.txt')
     if (Test-Path -LiteralPath $manifestPath) { [IO.File]::Replace($manifestTemp, $manifestPath, (Join-Path $final 'previous-release.json')); Remove-Item -LiteralPath (Join-Path $final 'previous-release.json') }

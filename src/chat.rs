@@ -54,12 +54,35 @@ impl ChatState {
         changed || picker_changed || was_busy != self.session.busy()
     }
 
+    pub fn reconcile_models(&mut self, models: &ModelSettings) {
+        if let Err(error) = self.session.reconcile_model_catalog(models.available_models()) { self.session.report(error); }
+    }
+
     pub fn dispatch(&mut self, action: ChatAction, models: &ModelSettings) -> bool {
         match action {
             ChatAction::New => self.session.new_conversation(),
             ChatAction::Select(id) => self.session.select_conversation(&id),
             ChatAction::Delete(id) => self.session.delete_conversation(&id),
-            ChatAction::SelectModel(model) => self.session.select_model(model),
+            ChatAction::SelectModel(model) => {
+                let result = models.available_models().iter().find(|option| option.model == model).ok_or_else(|| "聊天模型已失效，请刷新目录后重选。".to_owned())
+                    .and_then(|option| self.session.select_model_pair(option, None));
+                if let Err(error) = result { self.session.report(error); }
+            }
+            ChatAction::SelectModelPair { model, effort } => {
+                let result = models.available_models().iter().find(|option| option.model == model).ok_or_else(|| "聊天模型已失效，请刷新目录后重选。".to_owned())
+                    .and_then(|option| self.session.select_model_pair(option, effort));
+                if let Err(error) = result { self.session.report(error); }
+            }
+            ChatAction::ToggleFavorite(model) => {
+                if models.available_models().iter().any(|option| option.model == model) { self.session.toggle_model_favorite(model); }
+                else { self.session.report("聊天模型已失效，无法收藏。".into()); }
+            }
+            ChatAction::SetDefaultModelPair { model, effort } => {
+                let result = models.available_models().iter().find(|option| option.model == model).ok_or_else(|| "聊天模型已失效，无法设为默认。".to_owned())
+                    .and_then(|option| self.session.set_default_model_pair(option, effort));
+                if let Err(error) = result { self.session.report(error); }
+            }
+            ChatAction::RefreshModels { .. } => self.session.report("模型刷新必须由目录宿主执行。".into()),
             ChatAction::Draft(text) => self.session.set_draft(text),
             ChatAction::Stop => self.session.cancel(),
             ChatAction::Save => self.session.retry_save(),
