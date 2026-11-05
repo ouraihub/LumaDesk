@@ -26,12 +26,13 @@ impl ChatState {
             self.session.report("请先关闭文件选择窗口，再退出应用。".into());
             return false;
         }
-        self.session.can_close()
+        if !self.session.can_close() { return false; }
+        self.session.close().is_ok()
     }
 
     pub fn poll(&mut self) -> bool {
         let changed = self.wake.swap(false, Ordering::AcqRel);
-        let was_busy = self.session.busy();
+        let previous_phase = self.session.phase();
         self.session.poll();
         let result = self.picker.as_ref().map(|picker| picker.try_recv());
         let picker_changed = match result {
@@ -51,7 +52,7 @@ impl ChatState {
             }
             _ => false,
         };
-        changed || picker_changed || was_busy != self.session.busy()
+        changed || picker_changed || previous_phase != self.session.phase()
     }
 
     pub fn reconcile_models(&mut self, models: &ModelSettings) {
