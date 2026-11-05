@@ -8,6 +8,7 @@ license = "MIT OR Apache-2.0"
 gpui-kit = "=0.9.0"
 lumakit-ai = { path = "../LumaKit/crates/lumakit-ai" }
 lumakit-gpui = { path = "../LumaKit/crates/lumakit-gpui" }
+lumakit-usage-status = { path = "../LumaKit/crates/lumakit-usage-status" }
 lumakit-design = { path = "../LumaKit/crates/lumakit-design" }
 lumakit-support = { path = "../LumaKit/crates/lumakit-support" }
 lumakit-observability = { path = "../LumaKit/crates/lumakit-observability" }

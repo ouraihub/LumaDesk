@@ -26,6 +26,7 @@ pub(crate) struct SearchKeyRow {
 pub(crate) struct SearchConfigRow {
     pub provider: String,
     pub endpoint: String,
+    pub username: String,
     pub keys: Vec<SearchKeyRow>,
 }
 
@@ -86,6 +87,8 @@ pub(crate) fn load_search(root: &Path) -> Result<Option<SearchData>, String> {
     let preferences = serde_json::from_str(&preferences).map_err(|e| format!("搜索偏好 JSON 无效：{e}"))?;
     let compression = serde_json::from_str::<Value>(&compression).map_err(|e| format!("搜索压缩设置 JSON 无效：{e}"))?.as_str().ok_or_else(|| "搜索压缩设置无效".to_owned())?.to_owned();
     let mut configs = Vec::new();
+    let usernames = connection.query_row("SELECT value FROM prefs WHERE key='search.usernames'", [], |row| row.get::<_, String>(0)).optional().map_err(|e| format!("无法读取搜索用户名：{e}"))?;
+    let usernames: std::collections::HashMap<String, String> = usernames.map(|raw| serde_json::from_str(&raw)).transpose().map_err(|_| "搜索用户名配置无效".to_owned())?.unwrap_or_default();
     let mut statement = connection.prepare("SELECT provider,endpoint FROM search_configs WHERE enabled=1 ORDER BY position").map_err(|e| format!("无法读取搜索配置：{e}"))?;
     let rows = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))).map_err(|e| format!("无法读取搜索配置：{e}"))?;
     for row in rows {
@@ -94,7 +97,8 @@ pub(crate) fn load_search(root: &Path) -> Result<Option<SearchData>, String> {
         let mut key_statement = connection.prepare("SELECT id,masked,ciphertext FROM search_keys WHERE provider=?1 ORDER BY rowid").map_err(|e| format!("无法读取搜索密钥：{e}"))?;
         let key_rows = key_statement.query_map([&provider], |row| Ok(SearchKeyRow { id: row.get(0)?, masked: row.get(1)?, ciphertext: row.get(2)? })).map_err(|e| format!("无法读取搜索密钥：{e}"))?;
         for key in key_rows { keys.push(key.map_err(|e| format!("无法读取搜索密钥：{e}"))?); }
-        configs.push(SearchConfigRow { provider, endpoint, keys });
+        let username = usernames.get(&provider).cloned().unwrap_or_default();
+        configs.push(SearchConfigRow { provider, endpoint, username, keys });
     }
     Ok(Some(SearchData { default_search, default_fetch, configs, preferences, compression }))
 }
@@ -105,9 +109,10 @@ pub(crate) fn save_search(root: &Path, data: &SearchData) -> Result<(), String> 
     let defaults = json(&defaults)?;
     let preferences = json(&data.preferences)?;
     let compression = json(&Value::String(data.compression.clone()))?;
+    let usernames = json(&serde_json::to_value(data.configs.iter().filter(|c| !c.username.is_empty()).map(|c| (&c.provider, &c.username)).collect::<std::collections::HashMap<_, _>>()).map_err(|_| "搜索用户名序列化失败".to_owned())?)?;
     let mut connection = open(root)?;
     let transaction = connection.transaction().map_err(|e| format!("无法开始搜索事务：{e}"))?;
-    for (key, value) in [("search.defaults", defaults), ("search.preferences", preferences), ("search.compression", compression)] {
+    for (key, value) in [("search.defaults", defaults), ("search.preferences", preferences), ("search.compression", compression), ("search.usernames", usernames)] {
         transaction.execute("INSERT INTO prefs(key,value,updated_at) VALUES(?1,?2,unixepoch()) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", params![key, value]).map_err(|e| format!("保存搜索偏好失败：{e}"))?;
     }
     transaction.execute("DELETE FROM search_keys", []).map_err(|e| format!("保存搜索密钥失败：{e}"))?;

@@ -6,6 +6,7 @@ use std::{path::{Path, PathBuf}, sync::{Arc, mpsc, atomic::{AtomicBool, Ordering
 
 pub struct ChatState {
     pub session: ChatSession,
+    pub usage_status: lumakit_usage_status::ContextStatus,
     wake: Arc<AtomicBool>,
     picker: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
 }
@@ -15,7 +16,7 @@ impl ChatState {
         let wake = Arc::new(AtomicBool::new(false));
         let signal = wake.clone();
         let session = ChatSession::open(&root.join("chat.db"), Arc::new(move || { signal.store(true, Ordering::Release); }))?;
-        Ok(Self { session, wake, picker: None })
+        Ok(Self { session, usage_status: lumakit_usage_status::ContextStatus::default(), wake, picker: None })
     }
 
     pub fn is_busy(&self) -> bool { self.session.busy() || self.picker.is_some() }
@@ -53,6 +54,10 @@ impl ChatState {
             _ => false,
         };
         changed || picker_changed || previous_phase != self.session.phase()
+    }
+    pub fn refresh_usage(&mut self, models: &ModelSettings) {
+        let settings = self.session.history().model.as_ref().and_then(|m| models.model_settings(m));
+        self.usage_status = crate::chat_usage::status(&self.session, settings);
     }
 
     pub fn reconcile_models(&mut self, models: &ModelSettings) {

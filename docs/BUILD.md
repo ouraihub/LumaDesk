@@ -44,6 +44,8 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 
 发布脚本显式按 UTF-8 解码 Cargo metadata，避免 Windows PowerShell 在中文仓库路径中生成乱码产物路径；模型目录的 OMP MIT 许可同时写入 `THIRD-PARTY.txt`。验证新版界面必须确认运行路径和发布哈希，不在编译尚未完成时启动旧 target EXE。
 
+输入栏的上下文／token／消费状态来自 LumaKit `lumakit-usage-status`；宿主使用请求时保存的用户模型单价快照，只有单价完整有效才显示 `≈$金额`／`≈¥金额`，否则显示 token，不套用目录参考价、不显示美元未知占位。`~` 是上下文估算，USD 用 `$`、CNY 用 `¥`，不换算。Windows 图标已实窗验证，macOS/Linux 仅预留资源与目标映射。高压力按 OMP 的百分比或绝对 token 阈值着色；魔杖只作状态标记。设计见 `../LumaKit/docs/context-usage-status.md`。
+
 ## 数据目录
 
 默认是 EXE 旁的 `data-gpui\`；`LUMADESK_DATA_DIR` 显式指定时优先。验证或截图请用临时目录，不要指向正式资料。同一目录有文件锁，不能同时开两个写入实例。

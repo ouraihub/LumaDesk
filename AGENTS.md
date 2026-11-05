@@ -2,13 +2,26 @@
 
 开始任何编码任务前，必须读取 `docs/AI工程规范.md`。它约束架构边界、接口、模块、日志、错误、语言、测试和验证。项目局部规则只能扩展它，不得降低安全、错误处理和验证要求。构建、检查与打包命令见 `docs/BUILD.md`。
 
-## UI：参考优先，禁止擅自发挥
+LumaDesk 是 AI agent 工作台。`experiment/gpui-kit` 分支界面用 GPUI（`gpui-kit = "=0.9.0"`）与 `../LumaKit` 的 `lumakit-design`、`lumakit-gpui`；`main` 分支仍是 egui 版，两边不要混改。
+
+## 界面令牌与共享组件
+
+- 颜色只取 `LumaTheme::global(cx).roles`，间距、尺寸、圆角、字体样式只取 `lumakit_design::metrics`；不写十六进制颜色，不在本仓库另建令牌或主题。缺的令牌、主题或通用组件加到 `lumakit-design`，并遵守 `../LumaKit/AGENTS.md`。
+- 设置页用 `lumakit_design::components::settings`；外观页就是 `lumakit_design::appearance::AppearancePage`，`src/theme.rs` 只负责存入 `settings.db` 和迁移旧格式。
+- 新控件要有可访问名称和角色，能用键盘聚焦和操作；读屏软件与 UI 自动化找不到的控件不算完成。
+
+## 设置页：参考 ThinkRail Native
+
+- 设置外框（分组导航 + 详情）与模型服务页（服务商栏 + 详情 + 模型区）以 ThinkRail Native 的设置面板为参考：`E:/workspace/notepad-dev/thinkrail-native/crates/app/src/panels/settings/`（`providers/`、`models/`）。改动前先读对应实现，不自创布局。
+- 模型设置的业务规则（独立启用提交、多线路多密钥、检测与同步语义）仍以 `docs/03-模型设置界面与交互改造.md` 为准；ThinkRail 只决定结构和视觉。
+
+## 聊天 UI：参考优先，禁止擅自发挥
 
 这是用户明确要求的长期约束，适用于新增、修改和修复界面。
 
 - AutoNote 是聊天界面的首要参考。先阅读其实际使用的共享组件，再动代码；不能只看宿主包装层，也不能凭印象自行设计。现有总设计：`docs/01-AI对话移植与LumaKit复用设计.md`。
-- 参考入口：`E:/workspace/notepad-dev/AutoNote/packages/app/src/features/ai/chat/ChatPanel.svelte`；沿实际依赖查找 `@ouraihub/aether-ui` 的 `chat/ChatPanel.svelte`、`MessageItem.svelte`、`ToolCallItem.svelte` 和 `providers/ModelSelect.svelte`。相邻 `../../Aether/packages/ui/src/` 可用于核对，版本差异须确认，不能把失效路径当成自由设计的理由。
-- 移植信息层级、布局、控件归属和交互，不另造一套。沿用当前产品主题与已有设计 token；参考行为不等于可以复制许可不明的代码或资源。
+- 参考组件：`E:/workspace/notepad-dev/Aether/packages/ui/src/`（即 AutoNote 所用的 `@ouraihub/aether-ui`）的 `chat/ChatPanel.svelte`、`chat/MessageItem.svelte`、`chat/ToolCallItem.svelte` 和 `providers/ModelSelect.svelte`。原宿主入口 `AutoNote/packages/app/src/features/ai/chat/ChatPanel.svelte` 已不在本机检出中（2026-11-04 核对，AutoNote 只剩 `desktop/src-tauri`）；拿到 AutoNote 前端后，先核对它锁定的 aether-ui 版本与上述目录是否一致。不能把失效路径当成自由设计的理由。
+- 移植信息层级、布局、控件归属和交互，不另造一套。外观只用 `lumakit-design` 的主题与令牌；参考行为不等于可以复制许可不明的代码或资源。
 - 输入区保持文字区和紧凑工具栏。生图是工具开关/可移除标签，不是独占聊天模式；模型设置不得变成占满整行的双下拉墙。
 - 「快捷面板 / 自定义工具栏」用于开关底栏工具的显示，不是提示词插入器。切换显示不能执行工具或改变当前请求设置；选择须持久化。未固定工具仍可从添加菜单执行，不得放置没有消费者的假开关。
 - 回答按来源、工具状态、图片、正文、操作分层并留出间距；生成图片内联可见、点击打开。次要动作进入更多菜单。

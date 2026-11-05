@@ -7,6 +7,7 @@ mod model_editor;
 mod search_settings;
 mod settings_store;
 mod mcp_settings;
+mod chat_usage;
 mod usage_settings;
 mod theme;
 
@@ -86,6 +87,7 @@ impl DesktopApp {
         let mcp = mcp_settings::McpSettings::create(&root, window, cx)?;
         let mut chat = chat::ChatState::new(&root)?;
         chat.reconcile_models(models.read(cx));
+        chat.refresh_usage(models.read(cx));
         let panel = cx.new(|cx| ChatPanel::new(window, cx));
         let query = cx.new(|cx| InputState::new(window, cx).placeholder("搜索设置"));
         let app = cx.new(|cx: &mut Context<Self>| {
@@ -97,12 +99,14 @@ impl DesktopApp {
                         let open_settings = this.chat.dispatch(action.clone(), this.models.read(cx));
                         if open_settings { this.open_settings(SettingsPage::Models, window, cx); }
                     }
+                    this.chat.refresh_usage(this.models.read(cx));
                     this.ensure_background(window, cx);
                     cx.notify();
                 }),
                 cx.observe(&panel, |_, _, cx| cx.notify()),
                 cx.observe_in(&models, window, |this, _, window, cx| {
                     this.chat.reconcile_models(this.models.read(cx));
+                    this.chat.refresh_usage(this.models.read(cx));
                     this.ensure_background(window, cx); cx.notify();
                 }),
                 cx.observe_in(&search, window, |this, _, window, cx| { this.ensure_background(window, cx); cx.notify(); }),
@@ -149,6 +153,7 @@ impl DesktopApp {
                     let mut changed = this.chat.poll();
                     changed |= this.models.update(cx, |models, cx| { let changed = models.poll(); if changed { cx.notify(); } changed });
                     changed |= this.search.update(cx, |search, cx| { let changed = search.poll(); if changed { cx.notify(); } changed });
+                    if changed { this.chat.refresh_usage(this.models.read(cx)); }
                     let busy = this.busy(cx);
                     if changed { cx.notify(); }
                     if !busy { this.background = None; }
@@ -260,6 +265,7 @@ impl Render for DesktopApp {
                         panel.set_external_busy(self.chat.picking());
                         panel.set_model_refresh_state(models.refreshing_catalog(), models.catalog_refresh_notice().to_owned());
                         let metadata = self.chat.session.history().model.as_ref().and_then(|model| models.model_settings(model));
+                        panel.set_usage_status(self.chat.usage_status.clone(), cx);
                         panel.render_session(&self.chat.session, models.available_models(), models.image_models(), metadata, window, cx)
                     }))
                 }
@@ -333,7 +339,7 @@ fn title_bar(r: Roles) -> TitleBar {
 }
 
 fn main() {
-    gpui_kit::application().with_assets(lumakit_gpui::PickerAssets(lumakit_design::UiAssets)).with_quit_mode(QuitMode::LastWindowClosed).run(|cx| {
+    gpui_kit::application().with_assets(lumakit_usage_status::UsageStatusAssets(lumakit_gpui::PickerAssets(lumakit_design::UiAssets))).with_quit_mode(QuitMode::LastWindowClosed).run(|cx| {
         gpui_kit::init(cx);
         // Logging starts with the data directory; the window reports a failure once it exists.
         let fonts = lumakit_design::fonts::register_bundled(cx).err().map(|error| format!("{error:#}"));

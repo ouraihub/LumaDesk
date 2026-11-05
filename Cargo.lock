@@ -3534,6 +3534,7 @@ dependencies = [
  "lumakit-gpui",
  "lumakit-observability",
  "lumakit-support",
+ "lumakit-usage-status",
  "reqwest",
  "rusqlite",
  "serde",
@@ -3585,6 +3586,7 @@ dependencies = [
  "lumakit-ai",
  "lumakit-design",
  "lumakit-model-picker",
+ "lumakit-usage-status",
  "pulldown-cmark",
 ]
 
@@ -3618,6 +3620,13 @@ dependencies = [
  "thiserror 2.0.21",
  "windows-sys 0.61.2",
  "zeroize",
+]
+
+[[package]]
+name = "lumakit-usage-status"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
 ]
 
 [[package]]
