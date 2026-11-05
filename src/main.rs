@@ -333,7 +333,7 @@ fn title_bar(r: Roles) -> TitleBar {
 }
 
 fn main() {
-    gpui_kit::application().with_assets(lumakit_design::UiAssets).with_quit_mode(QuitMode::LastWindowClosed).run(|cx| {
+    gpui_kit::application().with_assets(lumakit_gpui::PickerAssets(lumakit_design::UiAssets)).with_quit_mode(QuitMode::LastWindowClosed).run(|cx| {
         gpui_kit::init(cx);
         // Logging starts with the data directory; the window reports a failure once it exists.
         let fonts = lumakit_design::fonts::register_bundled(cx).err().map(|error| format!("{error:#}"));
