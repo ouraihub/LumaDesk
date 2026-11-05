@@ -1,6 +1,6 @@
 # LumaDesk
 
-独立的纯 Rust 桌面宿主 App（AI agent 工作台）。`main` 分支用 GPUI（gpui-kit 0.9.0）绘制原生窗口，接入 `LumaKit` 的 `lumakit-design`、`lumakit-gpui` 与 `lumakit-ai`；旧 egui 版保留在 `legacy/egui` 分支。
+独立的纯 Rust 桌面宿主 App（AI agent 工作台）。`main` 分支用 GPUI（gpui-kit 0.9.0）绘制原生窗口，接入 `LumaKit` 的 `lumakit-design`、`lumakit-gpui` 与 `lumakit-ai`；旧 egui 版保留在标签 `legacy-egui`。
 
 ## 运行
 
