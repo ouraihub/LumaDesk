@@ -16,6 +16,19 @@ function Hash([string]$Path) {
     try { ([BitConverter]::ToString($sha.ComputeHash($stream))).Replace('-', '').ToLowerInvariant() }
     finally { $stream.Dispose(); $sha.Dispose() }
 }
+function Assert-FileAvailable([string]$Path) {
+    if (!(Test-Path -LiteralPath $Path)) { return }
+    $stream = $null
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+    }
+    catch [IO.IOException] {
+        throw "Cannot replace '$Path' because it is in use. Close the running application and retry."
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
 function Check-Package([string]$Path, [string]$ExpectedHash) {
     $archive = [IO.Compression.ZipFile]::OpenRead($Path)
     try {
@@ -50,9 +63,11 @@ try {
     $package = @($metadata.packages | Where-Object { $_.name -eq 'luma-desk' })
     if ($package.Count -ne 1) { throw 'Expected exactly one luma-desk package.' }
     $version = $package[0].version
+    $source = Join-Path $metadata.target_directory 'x86_64-pc-windows-msvc/release/luma-desk.exe'
+    Assert-FileAvailable $source
+    Assert-FileAvailable $exe
     & (Join-Path $root 'scripts/cargo-msvc.bat') build --release --locked --target x86_64-pc-windows-msvc
     if ($LASTEXITCODE -ne 0) { throw 'Release build failed; previous published files unchanged.' }
-    $source = Join-Path $metadata.target_directory 'x86_64-pc-windows-msvc/release/luma-desk.exe'
     $header = [IO.File]::OpenRead($source)
     try { if ($header.ReadByte() -ne 77 -or $header.ReadByte() -ne 90) { throw 'Built file is not a Windows executable.' } }
     finally { $header.Dispose() }
