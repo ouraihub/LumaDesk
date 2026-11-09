@@ -35,6 +35,9 @@ struct Config {
     keys: Vec<SavedKey>,
     #[serde(default)]
     username: String,
+    /// Requests start from this key, then rotate in list order; `None` means the first key.
+    #[serde(default)]
+    selected_key: Option<String>,
 }
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -56,7 +59,6 @@ struct Draft {
     username: String,
     key: String,
     editing: Option<String>,
-    edit_value: String,
     revealed: Option<(String, String)>,
 }
 impl Draft {
@@ -66,13 +68,11 @@ impl Draft {
             username: config.username.clone(),
             key: String::new(),
             editing: None,
-            edit_value: String::new(),
             revealed: None,
         }
     }
     fn clear(&mut self) {
         self.key.zeroize();
-        self.edit_value.zeroize();
         self.editing = None;
         if let Some((_, mut value)) = self.revealed.take() {
             value.zeroize();
@@ -105,12 +105,12 @@ enum KeyAction {
     Add,
     Replace(String, String),
     Delete(String),
+    Select(String),
 }
 struct ProviderInputs {
     endpoint: Entity<InputState>,
     username: Entity<InputState>,
     key: Entity<InputState>,
-    edit: Entity<InputState>,
 }
 struct SearchInputs {
     providers: Vec<ProviderInputs>,
@@ -182,6 +182,7 @@ impl SearchSettings {
                     endpoint: provider.endpoint().into(),
                     keys: Vec::new(),
                     username: String::new(),
+                    selected_key: None,
                 });
                 added = true;
             }
@@ -246,9 +247,6 @@ impl SearchSettings {
                 provider
                     .key
                     .update(cx, |input, cx| input.set_value("", window, cx));
-                provider
-                    .edit
-                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
         cx.notify();
@@ -274,9 +272,6 @@ impl SearchSettings {
             inputs.providers[index]
                 .key
                 .update(cx, |input, cx| input.set_value("", window, cx));
-            inputs.providers[index]
-                .edit
-                .update(cx, |input, cx| input.set_value("", window, cx));
         }
     }
     fn start_request(&mut self, fetch: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -288,8 +283,8 @@ impl SearchSettings {
         let _ = window;
         cx.notify();
     }
-    fn check_provider(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.is_busy() || !self.submit(index, None, window, cx) {
+    fn check_provider(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.is_busy() || !self.submit_card(index, cx) {
             return;
         }
         self.launch(self.stored.configs[index].provider.is_fetch(), Some(index));
@@ -442,7 +437,11 @@ fn add_key(config: &mut Config, value: &str) -> Result<(), String> {
     if config.keys.len() >= 16 {
         return Err("每个服务商最多 16 个密钥".into());
     }
-    config.keys.push(SavedKey::new(value.trim())?);
+    let key = SavedKey::new(value.trim())?;
+    if config.selected_key.is_none() {
+        config.selected_key = Some(key.id.clone());
+    }
+    config.keys.push(key);
     Ok(())
 }
 fn validate_stored(value: &Stored) -> Result<(), String> {
@@ -484,6 +483,13 @@ fn validate_stored(value: &Stored) -> Result<(), String> {
             if key.id.is_empty() || key.ciphertext.is_empty() || !seen.insert(&key.id) {
                 return Err("密钥配置无效".into());
             }
+        }
+        if config
+            .selected_key
+            .as_ref()
+            .is_some_and(|id| !seen.contains(id))
+        {
+            return Err("密钥配置无效".into());
         }
     }
     Ok(())

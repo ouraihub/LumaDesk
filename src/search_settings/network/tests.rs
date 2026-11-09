@@ -50,6 +50,7 @@ fn config(provider: Provider, endpoint: String, key: bool) -> Config {
         } else {
             Vec::new()
         },
+        selected_key: None,
     }
 }
 fn run<T>(future: impl Future<Output = T>) -> T {
@@ -220,7 +221,14 @@ fn every_fetch_provider_sends_target_and_decodes_content() {
             assert!(!page.body.contains("hidden()"));
             assert!(!page.body.contains('<'));
         } else {
-            assert_eq!(page.body, if provider == Provider::Jina { "Title: Found\n\nbody" } else { "body" });
+            assert_eq!(
+                page.body,
+                if provider == Provider::Jina {
+                    "Title: Found\n\nbody"
+                } else {
+                    "body"
+                }
+            );
         }
     }
 }

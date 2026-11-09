@@ -1,4 +1,4 @@
-//! AutoNote-shaped provider cards, credential manager and advanced search tools.
+//! AutoNote-shaped provider cards, shared key controls and advanced search tools.
 use super::*;
 use catalog::{FETCH_PROVIDERS, SEARCH_PROVIDERS};
 use gpui_kit::assets::IconName;
@@ -28,21 +28,6 @@ fn card() -> gpui_kit::Div {
 }
 fn field(name: &'static str, input: impl IntoElement, cx: &gpui_kit::App) -> gpui_kit::Div {
     ui::field(name, input, &lumakit_design::LumaTheme::global(cx).roles)
-}
-fn icon_button(
-    id: impl Into<gpui_kit::ElementId>,
-    icon: IconName,
-    name: impl Into<gpui_kit::SharedString>,
-    busy: bool,
-) -> Button {
-    let name = name.into();
-    Button::new(id)
-        .small()
-        .outline()
-        .icon(icon)
-        .accessibility_label(name.clone())
-        .tooltip(name)
-        .disabled(busy)
 }
 mod advanced;
 mod keys;

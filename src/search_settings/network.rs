@@ -137,6 +137,17 @@ async fn read_limited(
     Ok((status, content_type, body))
 }
 
+/// The `attempt`-th key to try: the preferred key first, then the rest in list order, wrapping.
+fn nth_key(config: &Config, attempt: usize) -> Option<&SavedKey> {
+    let first = config
+        .selected_key
+        .as_ref()
+        .and_then(|id| config.keys.iter().position(|key| &key.id == id))
+        .unwrap_or(0);
+    let count = config.keys.len();
+    (count > 0).then(|| &config.keys[(first + attempt) % count])
+}
+
 pub(super) async fn search_query(
     config: Config,
     query: String,
@@ -160,7 +171,7 @@ pub(super) async fn search_query(
     let count = max.min(20).to_string();
     let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
-        let secret = config.keys.get(index).map(SavedKey::open).transpose()?;
+        let secret = nth_key(&config, index).map(SavedKey::open).transpose()?;
         let key = secret.as_ref().map(|value| value.as_str());
         let mut target = endpoint.clone();
         if config.provider == Provider::JinaSearch
@@ -289,7 +300,7 @@ pub(super) async fn fetch_page(
     let endpoint = endpoint_for(&config, false)?;
     let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
-        let secret = config.keys.get(index).map(SavedKey::open).transpose()?;
+        let secret = nth_key(&config, index).map(SavedKey::open).transpose()?;
         let key = secret.as_ref().map(|value| value.as_str());
         let request = match config.provider {
             Provider::Jina => auth(

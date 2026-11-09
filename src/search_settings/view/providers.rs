@@ -99,77 +99,7 @@ impl SearchSettings {
             .border_color(r.border_muted)
             .pt(space::S12);
         if provider != Provider::Direct {
-            let mut heading = h_flex().gap(space::S8).child(label(
-                text::UI,
-                if provider == Provider::Searxng {
-                    "密码（可选）"
-                } else {
-                    "API 密钥"
-                },
-            ));
-            if let Some(url) = provider.key_site() {
-                heading = heading.child(
-                    Button::new(("get-key", index))
-                        .small()
-                        .link()
-                        .label("获取密钥")
-                        .on_click(move |_, _, cx| cx.open_url(url)),
-                );
-            }
-            let masked = if config.keys.is_empty() {
-                "未配置".to_owned()
-            } else {
-                config
-                    .keys
-                    .iter()
-                    .map(|key| key.masked.as_str())
-                    .collect::<Vec<_>>()
-                    .join(" · ")
-            };
-            let keys = icon_button(
-                ("manage-search-keys", index),
-                IconName::List,
-                format!("管理密钥 · {}", provider.name()),
-                busy,
-            )
-            .on_click(cx.listener(move |this, _, window, cx| {
-                this.previous_focus = window.focused(cx);
-                this.clear_provider(index, window, cx);
-                this.key_dialog = Some(index);
-                if let Some(inputs) = &this.inputs {
-                    inputs.focus.focus(window, cx);
-                }
-                cx.notify();
-            }));
-            let check = icon_button(
-                ("check-search", index),
-                IconName::Activity,
-                format!("检测 · {}", provider.name()),
-                busy,
-            )
-            .on_click(
-                cx.listener(move |this, _, window, cx| this.check_provider(index, window, cx)),
-            );
-            fields = fields.child(
-                v_flex()
-                    .gap(space::S6)
-                    .child(heading)
-                    .child(
-                        h_flex()
-                            .flex_nowrap()
-                            .gap(space::S8)
-                            .child(
-                                div().flex_1().min_w_0().child(
-                                    Input::new(&input.key)
-                                        .aria_label(format!("{} 新密钥", provider.name()))
-                                        .disabled(busy),
-                                ),
-                            )
-                            .child(keys)
-                            .child(check),
-                    )
-                    .child(label(text::METADATA, masked).text_color(r.text_muted)),
-            );
+            fields = fields.child(self.key_section(index, cx));
         }
         if provider == Provider::Searxng {
             fields = fields.child(field(
@@ -185,17 +115,47 @@ impl SearchSettings {
                 "基础地址",
                 Input::new(&input.endpoint)
                     .aria_label(format!("{} 基础地址", provider.name()))
-                    .suffix(Button::new(("copy-search-address", index)).xsmall().ghost().icon(IconName::Copy)
-                        .accessibility_label(format!("复制基础地址 · {}", provider.name())).disabled(busy)
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            if let Some(inputs) = &this.inputs { cx.write_to_clipboard(ClipboardItem::new_string(inputs.providers[index].endpoint.read(cx).value().to_string())); }
-                        })))
+                    .suffix(
+                        Button::new(("copy-search-address", index))
+                            .xsmall()
+                            .ghost()
+                            .icon(IconName::Copy)
+                            .accessibility_label(format!("复制基础地址 · {}", provider.name()))
+                            .disabled(busy)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(inputs) = &this.inputs {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        inputs.providers[index]
+                                            .endpoint
+                                            .read(cx)
+                                            .value()
+                                            .to_string(),
+                                    ));
+                                }
+                            })),
+                    )
                     .disabled(busy),
                 cx,
             ));
         } else {
-            fields = fields.child(label(text::METADATA, "无需配置密钥或基础地址。下方输入网址读取，检测将请求 https://example.com。").text_color(r.text_muted))
-                .child(icon_button(("check-direct", index), IconName::Activity, "检测 · 直接获取", busy).on_click(cx.listener(move |this, _, window, cx| this.check_provider(index, window, cx))));
+            let check = Button::new(("check-direct", index))
+                .outline()
+                .label("检测")
+                .accessibility_label("检测 · 直接获取")
+                .disabled(busy)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.check_provider(index, cx);
+                    cx.notify();
+                }));
+            fields = fields
+  .child(
+      label(
+   text::METADATA,
+   "无需配置密钥或基础地址。下方输入网址读取，检测将请求 https://example.com。",
+      )
+      .text_color(r.text_muted),
+         )
+         .child(h_flex().child(check));
         }
         let mut footer = h_flex().flex_wrap().gap(space::S8);
         if provider != Provider::Direct {
@@ -206,8 +166,8 @@ impl SearchSettings {
                     .label("保存")
                     .accessibility_label(format!("保存 · {}", provider.name()))
                     .disabled(busy)
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.submit(index, None, window, cx);
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.submit_card(index, cx);
                         cx.notify();
                     })),
             );

@@ -12,6 +12,7 @@ impl Default for Stored {
                     endpoint: provider.endpoint().into(),
                     keys: Vec::new(),
                     username: String::new(),
+                    selected_key: None,
                 })
                 .collect(),
             preferences: SearchPreferences::default(),
@@ -36,6 +37,7 @@ impl Stored {
                         provider: provider(row.provider)?,
                         endpoint: row.endpoint,
                         username: row.username,
+                        selected_key: row.selected_key,
                         keys: row
                             .keys
                             .into_iter()
@@ -79,6 +81,7 @@ impl Stored {
                                 ciphertext: key.ciphertext.clone(),
                             })
                             .collect(),
+                        selected_key: config.selected_key.clone(),
                     })
                     .collect(),
                 preferences: serde_json::to_value(&self.preferences)

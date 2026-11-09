@@ -42,22 +42,28 @@ impl SearchSettings {
         }
         cx.notify();
     }
+    /// Commits one provider: `None` saves the card (address, Basic username) and never touches
+    /// credentials; `Some` changes credentials only, never unfinished address drafts.
     pub(super) fn save(&mut self, index: usize, action: Option<KeyAction>) -> Result<(), String> {
         let mut next = self.stored.clone();
         let config = &mut next.configs[index];
-        // Credential manager changes credentials only, never unfinished address or policy drafts.
-        if action.is_none() {
-            let endpoint = self.drafts[index].endpoint.trim();
-            config.endpoint = if endpoint.is_empty() {
-                config.provider.endpoint().into()
-            } else {
-                endpoint.into()
-            };
-            config.username = self.drafts[index].username.trim().into();
-        }
         let mut clear_added = false;
         match action {
-            Some(KeyAction::Delete(id)) => config.keys.retain(|key| key.id != id),
+            None => {
+                let endpoint = self.drafts[index].endpoint.trim();
+                config.endpoint = if endpoint.is_empty() {
+                    config.provider.endpoint().into()
+                } else {
+                    endpoint.into()
+                };
+                config.username = self.drafts[index].username.trim().into();
+            }
+            Some(KeyAction::Delete(id)) => {
+                config.keys.retain(|key| key.id != id);
+                if config.selected_key.as_ref() == Some(&id) {
+                    config.selected_key = config.keys.first().map(|key| key.id.clone());
+                }
+            }
             Some(KeyAction::Replace(id, value)) => {
                 let value = zeroize::Zeroizing::new(value);
                 validate_key(&value)?;
@@ -66,17 +72,17 @@ impl SearchSettings {
                     .iter_mut()
                     .find(|key| key.id == id)
                     .ok_or("密钥不存在")?
-                    .replace(&value)?;
+                    .replace(value.trim())?;
             }
             Some(KeyAction::Add) => {
                 add_key(config, &self.drafts[index].key)?;
                 clear_added = true;
             }
-            None => {
-                if !self.drafts[index].key.trim().is_empty() {
-                    add_key(config, &self.drafts[index].key)?;
-                    clear_added = true;
+            Some(KeyAction::Select(id)) => {
+                if !config.keys.iter().any(|key| key.id == id) {
+                    return Err("密钥不存在".into());
                 }
+                config.selected_key = Some(id);
             }
         }
         next.save(&self.root)
@@ -87,35 +93,63 @@ impl SearchSettings {
         }
         Ok(())
     }
-    pub(super) fn submit(
-        &mut self,
-        index: usize,
-        action: Option<KeyAction>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if action.is_none() && let Some(inputs) = &self.inputs {
+    /// Saves the card's address and username from its inputs.
+    pub(super) fn submit_card(&mut self, index: usize, cx: &mut Context<Self>) -> bool {
+        if let Some(inputs) = &self.inputs {
             let input = &inputs.providers[index];
             self.drafts[index].endpoint = input.endpoint.read(cx).value().to_string();
             self.drafts[index].username = input.username.read(cx).value().to_string();
-            self.drafts[index].key.zeroize();
-            self.drafts[index].key = input.key.read(cx).value().to_string();
         }
-        match self.save(index, action) {
-            Ok(()) => {
-                self.card_error[index] = false;
-                self.card_status[index] = "已保存".into();
-                if self.drafts[index].key.is_empty() && let Some(inputs) = &self.inputs {
-                    inputs.providers[index].key.update(cx, |input, cx| input.set_value("", window, cx));
-                }
-                true
-            }
-            Err(error) => {
-                self.card_error[index] = true;
-                self.card_status[index] = error;
-                false
-            }
+        let result = self.save(index, None);
+        self.report(index, result, "已保存")
+    }
+    /// Commits a credential change; the shared key input is cleared only on success.
+    pub(super) fn submit_key(
+        &mut self,
+        index: usize,
+        action: KeyAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let success = match action {
+            KeyAction::Add | KeyAction::Replace(..) => "密钥已加密保存",
+            KeyAction::Delete(_) => "已删除",
+            KeyAction::Select(_) => "密钥选择已保存",
+        };
+        let result = self.save(index, Some(action));
+        let saved = self.report(index, result, success);
+        if saved {
+            self.clear_provider(index, window, cx);
         }
+        saved
+    }
+    /// Saves the key input as a new key, or as the replacement of the key being edited.
+    pub(super) fn save_key_input(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(inputs) = &self.inputs else {
+            return;
+        };
+        let value = inputs.providers[index].key.read(cx).value().to_string();
+        let action = match self.drafts[index].editing.clone() {
+            Some(id) => KeyAction::Replace(id, value),
+            None => {
+                self.drafts[index].key.zeroize();
+                self.drafts[index].key = value;
+                KeyAction::Add
+            }
+        };
+        self.submit_key(index, action, window, cx);
+    }
+    fn report(&mut self, index: usize, result: Result<(), String>, success: &str) -> bool {
+        self.card_error[index] = result.is_err();
+        self.card_status[index] = result
+            .as_ref()
+            .map_or_else(Clone::clone, |()| success.into());
+        result.is_ok()
     }
     pub(super) fn save_preferences(&mut self, cx: &Context<Self>) {
         let Some(inputs) = &self.inputs else {

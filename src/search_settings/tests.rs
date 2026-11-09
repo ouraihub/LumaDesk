@@ -95,6 +95,7 @@ fn direct_fetch_uses_real_loopback_http_and_unicode_cutoff() {
         endpoint: String::new(),
         keys: Vec::new(),
         username: String::new(),
+        selected_key: None,
     };
     let mut prefs = SearchPreferences::default();
     prefs.cutoff = 100;
@@ -147,8 +148,9 @@ fn search_http_and_encrypted_restart_readback() {
     ));
     let mut settings = SearchSettings::load(&root).unwrap();
     settings.drafts[0].endpoint = endpoint;
-    settings.drafts[0].key = "local-test-key".into();
     settings.save(0, None).unwrap();
+    settings.drafts[0].key = "local-test-key".into();
+    settings.save(0, Some(KeyAction::Add)).unwrap();
     let restored = SearchSettings::load(&root).unwrap();
     assert_eq!(
         restored.stored.configs[0].keys[0].open().unwrap().as_str(),
@@ -228,13 +230,16 @@ fn search_fails_over_only_auth_status_and_filters_before_result_limit() {
             }
         }
     });
+    // The preferred key is the second one: requests start there and wrap to the first.
+    let keys = vec![
+        SavedKey::new("failover-second").unwrap(),
+        SavedKey::new("failover-first").unwrap(),
+    ];
     let config = Config {
         provider: Provider::Tavily,
         endpoint,
-        keys: vec![
-            SavedKey::new("failover-first").unwrap(),
-            SavedKey::new("failover-second").unwrap(),
-        ],
+        selected_key: Some(keys[1].id.clone()),
+        keys,
         username: String::new(),
     };
     let mut prefs = SearchPreferences::default();
@@ -279,10 +284,7 @@ fn provider_save_and_key_manager_do_not_commit_other_drafts() {
         Provider::Jina.endpoint()
     );
     assert_eq!(restored.stored.preferences.max_results, 5);
-    assert_eq!(
-        restored.stored.configs[0].keys[0].open().unwrap().as_str(),
-        "card-key"
-    );
+    assert!(restored.stored.configs[0].keys.is_empty());
     settings.drafts[0].endpoint = "invalid new address".into();
     settings.drafts[0].key = "manager-key".into();
     settings.save(0, Some(KeyAction::Add)).unwrap();
@@ -292,7 +294,7 @@ fn provider_save_and_key_manager_do_not_commit_other_drafts() {
         "https://search.example/v1"
     );
     assert_eq!(
-        restored.stored.configs[0].keys[1].open().unwrap().as_str(),
+        restored.stored.configs[0].keys[0].open().unwrap().as_str(),
         "manager-key"
     );
     drop(restored);
@@ -349,8 +351,9 @@ fn key_edit_delete_and_basic_username_survive_restart_atomically() {
         .position(|c| c.provider == Provider::Searxng)
         .unwrap();
     settings.drafts[index].username = "local-user".into();
-    settings.drafts[index].key = "initial-password".into();
     settings.save(index, None).unwrap();
+    settings.drafts[index].key = "initial-password".into();
+    settings.save(index, Some(KeyAction::Add)).unwrap();
     let id = settings.stored.configs[index].keys[0].id.clone();
     settings
         .save(
@@ -409,12 +412,10 @@ fn invalid_card_preserves_saved_credentials_and_empty_address_restores_default()
     ));
     let mut settings = SearchSettings::load(&root).unwrap();
     settings.drafts[0].key = "saved-key".into();
-    settings.save(0, None).unwrap();
+    settings.save(0, Some(KeyAction::Add)).unwrap();
     let ciphertext = settings.stored.configs[0].keys[0].ciphertext.clone();
     settings.drafts[0].endpoint = "not a URL".into();
-    settings.drafts[0].key = "must-remain-draft".into();
     assert!(settings.save(0, None).is_err());
-    assert_eq!(settings.drafts[0].key, "must-remain-draft");
     assert_eq!(settings.stored.configs[0].keys[0].ciphertext, ciphertext);
     let restored = SearchSettings::load(&root).unwrap();
     assert_eq!(restored.stored.configs[0].keys.len(), 1);
@@ -423,7 +424,6 @@ fn invalid_card_preserves_saved_credentials_and_empty_address_restores_default()
         Provider::Tavily.endpoint()
     );
     settings.drafts[0].endpoint.clear();
-    settings.drafts[0].key.clear();
     settings.save(0, None).unwrap();
     assert_eq!(
         settings.stored.configs[0].endpoint,
@@ -475,8 +475,9 @@ fn check_uses_saved_snapshot_and_does_not_replace_manual_results() {
     });
     let mut settings = SearchSettings::load(&root).unwrap();
     settings.drafts[0].endpoint = endpoint;
-    settings.drafts[0].key = "check-key".into();
     settings.save(0, None).unwrap();
+    settings.drafts[0].key = "check-key".into();
+    settings.save(0, Some(KeyAction::Add)).unwrap();
     settings.query = "unsaved-query".into();
     settings.result = Some(SearchResult {
         query: "previous".into(),
@@ -494,5 +495,73 @@ fn check_uses_saved_snapshot_and_does_not_replace_manual_results() {
     assert_eq!(settings.result.as_ref().unwrap().query, "previous");
     server.join().unwrap();
     drop(settings);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn preferred_key_survives_restart_delete_and_v1_database_upgrade() {
+    let root = std::env::temp_dir().join(format!(
+        "lumadesk-search-preferred-{}",
+        lumakit_support::new_id().unwrap()
+    ));
+    let mut settings = SearchSettings::load(&root).unwrap();
+    for value in ["key-a", "key-b", "key-c"] {
+        settings.drafts[0].key = value.into();
+        settings.save(0, Some(KeyAction::Add)).unwrap();
+    }
+    let ids: Vec<String> = settings.stored.configs[0]
+        .keys
+        .iter()
+        .map(|key| key.id.clone())
+        .collect();
+    // The first saved key becomes preferred; choosing another persists across restarts.
+    assert_eq!(
+        settings.stored.configs[0].selected_key.as_ref(),
+        Some(&ids[0])
+    );
+    assert!(
+        settings
+            .save(0, Some(KeyAction::Select("missing".into())))
+            .is_err()
+    );
+    settings
+        .save(0, Some(KeyAction::Select(ids[1].clone())))
+        .unwrap();
+    let restored = SearchSettings::load(&root).unwrap();
+    assert_eq!(
+        restored.stored.configs[0].selected_key.as_ref(),
+        Some(&ids[1])
+    );
+    // Deleting the preferred key falls back to the first remaining key.
+    settings
+        .save(0, Some(KeyAction::Delete(ids[1].clone())))
+        .unwrap();
+    let restored = SearchSettings::load(&root).unwrap();
+    assert_eq!(
+        restored.stored.configs[0].selected_key.as_ref(),
+        Some(&ids[0])
+    );
+    assert_eq!(restored.stored.configs[0].keys.len(), 2);
+    drop(restored);
+    drop(settings);
+    // A schema-1 database has no preference column: it upgrades with keys kept and none chosen.
+    let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+    db.execute_batch("ALTER TABLE search_configs DROP COLUMN selected_key; PRAGMA user_version=1;")
+        .unwrap();
+    drop(db);
+    let upgraded = SearchSettings::load(&root).unwrap();
+    assert_eq!(upgraded.stored.configs[0].keys.len(), 2);
+    assert_eq!(upgraded.stored.configs[0].selected_key, None);
+    assert_eq!(
+        upgraded.stored.configs[0].keys[0].open().unwrap().as_str(),
+        "key-a"
+    );
+    drop(upgraded);
+    // A preference naming no saved key is corruption, not something to repair silently.
+    let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+    db.execute_batch("UPDATE search_configs SET selected_key='missing' WHERE position=0;")
+        .unwrap();
+    drop(db);
+    assert!(SearchSettings::load(&root).is_err());
     std::fs::remove_dir_all(root).unwrap();
 }
