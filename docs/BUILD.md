@@ -90,6 +90,8 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 
 2026-11-10 搜索续作验证：`test --locked search_settings` 21 项、`test --locked settings_store` 1 项、fmt 检查及严格 clippy 通过。隔离实窗验证密钥留空只改标签且密文不变、SQLite trigger 保存失败/重试及 Switch 回滚、重启状态、仅第二把启用密钥实际发送、全部停用零网络、回环 HTTP 成功/429/取消与进行中禁用。320/375/414/768 逻辑客户端宽度均已截图检查，管理输入、动作、Switch、关闭可达；日志未包含测试密钥。截图目录 `C:/Users/Administrator/AppData/Local/Temp/search-key-consistency-c63rjq46/`，最终布局为 `search-final-client-*.png`。本节验证的是 `target/debug/luma-desk.exe`，不代表上一节已发布 EXE 已包含本次搜索改动。
 
+搜索版正式发布：源码提交 `443ccd9`，`scripts/build-app.bat` 完整通过（Kit release 195 项、宿主 release 49 项）；构建标识 `0.1.0-5e1a0b554afc473d90b261a27abdbd03`。EXE SHA-256 `fa3a3bec88f5591edd1f47be7c9836ab68d93fdac9b5cc358b12af41cc45bda0`；EXE、ZIP 和包内 EXE 校验通过。新发布 EXE 已用隔离数据实窗打开网络搜索密钥管理，确认标签/密钥输入可访问并正常退出（退出码 0）；隔离目录 `C:/Users/Administrator/AppData/Local/Temp/search-release-u31j_l2q/`。上述 debug 验证范围与此正式发布冒烟分别记录，不将前者视为全部 release 场景重测。
+
 ## 已知问题
 
 - **Windows Debug 栈溢出**：GPUI 嵌套布局超出默认 1 MiB 主线程栈，`build.rs` 设置 `/STACK:8000000`。
