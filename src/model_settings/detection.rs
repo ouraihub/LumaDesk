@@ -54,9 +54,18 @@ pub(super) fn detect_models(
                 return Err(Failure::Cancelled);
             }
             let secret = key
-                .map(SavedKey::open)
-                .transpose()
-                .map_err(|message| Failure::failed("SETTINGS_SECRET_FAILED", message))?;
+                .map(|key| {
+                    task::sync(
+                        trace,
+                        "settings.keys.secret.open",
+                        "SETTINGS_SECRET_FAILED",
+                        || {
+                            key.open()
+                                .map_err(|_| "无法解密已保存密钥；原凭据未修改".into())
+                        },
+                    )
+                })
+                .transpose()?;
             let mut ids = Vec::new();
             let mut seen = HashSet::new();
             let mut cursors = HashSet::new();

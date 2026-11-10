@@ -2,6 +2,8 @@
 
 开始任何编码任务前，必须读取 `docs/AI工程规范.md`。它约束架构边界、接口、模块、日志、错误、语言、测试和验证。项目局部规则只能扩展它，不得降低安全、错误处理和验证要求。构建、检查与打包命令见 `docs/BUILD.md`。
 
+日志与异常改动必须先读 `docs/日志与异常规范.md`；它规定最终错误所有者、链路终态、持久化失败、取消/关闭、脱敏和 panic 落盘。排查操作见 `docs/日志查看与问题排查指南.md`。
+
 LumaDesk 是 AI agent 工作台。`main` 分支界面用 GPUI（`gpui-kit = "=0.9.0"`）与 `../LumaKit` 的 `lumakit-design`、`lumakit-gpui`；旧 egui 版保留在标签 `legacy-egui`，不再修改。
 
 ## 界面令牌与共享组件

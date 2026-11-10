@@ -5,6 +5,7 @@ mod catalog_refresh;
 mod data;
 mod detection;
 mod editor;
+mod persistence;
 mod worker;
 use data::*;
 use detection::detect_models;
@@ -184,53 +185,6 @@ pub struct ModelSettings {
 }
 
 impl ModelSettings {
-    fn load(root: &Path) -> Result<Self, String> {
-        let mut store = CatalogStore::open(root)?;
-        let (providers, presets_initialized) = store.load()?;
-        let mut saved = SettingsFile {
-            providers,
-            presets_initialized,
-        };
-        project(&saved)?;
-        if !saved.presets_initialized {
-            saved.seed_presets();
-            project(&saved)?;
-            store.save(&saved.providers, saved.presets_initialized)?;
-        }
-        let mut state = Self {
-            store,
-            draft: saved.clone(),
-            catalog: ModelCatalog::new(saved.providers.clone()),
-            options: model_options(&saved),
-            image_options: model_options_for(&saved, ModelType::Image),
-            saved,
-            provider: None,
-            endpoint: None,
-            search: String::new(),
-            key_drafts: HashMap::new(),
-            notice: String::new(),
-            error: false,
-            diagnostic_trace: None,
-            catalog_diagnostic_trace: None,
-            dirty: false,
-            delete_provider: None,
-            delete_endpoint: None,
-            delete_key: None,
-            sync_dialog: None,
-            job: None,
-            catalog_refresh: None,
-            catalog_refresh_notice: String::new(),
-            provider_filter: 0,
-            model_query: String::new(),
-            capability_filter: 0,
-            folded: HashSet::new(),
-            editor: None,
-            view: None,
-        };
-        state.repair_selection();
-        Ok(state)
-    }
-
     fn indices(&self) -> Option<(usize, Option<usize>)> {
         let p = self
             .draft
@@ -282,74 +236,21 @@ impl ModelSettings {
             }
         }
     }
-    fn save(&mut self) -> Result<(), String> {
-        project(&self.draft)?;
-        self.store
-            .save(&self.draft.providers, self.draft.presets_initialized)?;
-        self.saved = self.draft.clone();
-        self.catalog = ModelCatalog::new(self.saved.providers.clone());
-        self.options = model_options(&self.saved);
-        self.image_options = model_options_for(&self.saved, ModelType::Image);
-        self.dirty = false;
-        Ok(())
-    }
-    fn persist_keys(&mut self, p: usize, e: usize) -> Result<(), String> {
-        let endpoint = &self.draft.providers[p].endpoints[e];
-        let saved = self
-            .saved
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == self.draft.providers[p].id)
-            .and_then(|provider| {
-                provider
-                    .endpoints
-                    .iter_mut()
-                    .find(|saved| saved.id == endpoint.id)
-            })
-            .ok_or("线路已不存在")?;
-        self.store.save_keys(
-            &endpoint.id,
-            &endpoint.keys,
-            endpoint.selected_key.as_deref(),
-        )?;
-        saved.keys.clone_from(&endpoint.keys);
-        saved.selected_key.clone_from(&endpoint.selected_key);
-        self.catalog = ModelCatalog::new(self.saved.providers.clone());
-        self.options = model_options(&self.saved);
-        self.image_options = model_options_for(&self.saved, ModelType::Image);
-        Ok(())
-    }
-    fn commit(&mut self) {
-        let result = self.save();
-        self.report(result, "已保存");
-    }
-
-    fn set_enabled(&mut self, p: usize, enabled: bool) {
-        let id = self.draft.providers[p].id.clone();
-        let mut candidate = self.saved.clone();
-        let Some(provider) = candidate
-            .providers
-            .iter_mut()
-            .find(|provider| provider.id == id)
-        else {
-            return;
-        };
-        provider.enabled = enabled;
-        let result = self.store.set_enabled(&id, enabled);
-        if self.report(result, "已保存") {
-            self.saved = candidate;
-            self.draft.providers[p].enabled = enabled;
-            self.catalog = ModelCatalog::new(self.saved.providers.clone());
-            self.options = model_options(&self.saved);
-            self.image_options = model_options_for(&self.saved, ModelType::Image);
-        } else {
-            self.draft.providers[p].enabled = self
-                .saved
-                .providers
-                .iter()
-                .find(|provider| provider.id == id)
-                .is_some_and(|provider| provider.enabled);
-        }
+    fn report_task<T>(
+        &mut self,
+        trace: &lumakit_observability::TraceContext,
+        result: &Result<T, crate::settings_task::Failure>,
+        success: &str,
+    ) -> bool {
+        let accepted = self.report(
+            result
+                .as_ref()
+                .map(|_| ())
+                .map_err(|error| error.notice(trace)),
+            success,
+        );
+        self.diagnostic_trace = result.as_ref().err().map(|_| trace.trace_id().to_owned());
+        accepted
     }
 
     fn clear_drafts(&mut self) {
@@ -394,12 +295,12 @@ impl Drop for ModelSettings {
     fn drop(&mut self) {
         self.cancel_catalog_refresh();
         self.clear_drafts();
-        if let Some(job) = self.job.take() {
-            let _ = job.thread.join();
-            job.root.cancel("settings_closed");
-        }
+        self.close_job();
     }
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod logging_tests;

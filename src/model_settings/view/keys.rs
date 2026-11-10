@@ -161,21 +161,36 @@ impl ModelSettings {
             .hover_actions(!in_dialog)
             .all_actions(in_dialog)
             .on_copy(Self::listen(cx, move |this, _, cx| {
+                let (trace, root) =
+                    lumakit_observability::TraceContext::root("settings.keys.copy", "ui");
+                let _entered = root.span().clone().entered();
                 let result = this.draft.providers[p].endpoints[e]
                     .keys
                     .iter()
                     .find(|key| key.id == copy_id)
-                    .ok_or_else(|| "密钥已不存在".to_owned())
-                    .and_then(SavedKey::open);
-                match result {
-                    Ok(secret) => {
-                        cx.write_to_clipboard(ClipboardItem::new_string(secret.to_string()));
-                        this.notice = "已复制密钥到系统剪贴板；请留意其他程序访问剪贴板".into();
-                    }
-                    Err(error) => {
-                        this.report(Err(error), "");
-                    }
+                    .ok_or_else(|| {
+                        crate::settings_task::Failure::failed(
+                            "SETTINGS_TARGET_MISSING",
+                            "密钥已不存在",
+                        )
+                    })
+                    .and_then(|key| {
+                        crate::settings_task::sync(
+                            &trace,
+                            "settings.keys.secret.open",
+                            "SETTINGS_SECRET_FAILED",
+                            || key.open().map_err(|_| "无法解密密钥；原凭据未修改".into()),
+                        )
+                    });
+                this.report_task(
+                    &trace,
+                    &result,
+                    "已复制密钥到系统剪贴板；请留意其他程序访问剪贴板",
+                );
+                if let Ok(secret) = &result {
+                    cx.write_to_clipboard(ClipboardItem::new_string(secret.to_string()));
                 }
+                crate::settings_task::end(root, &result);
             }))
             .on_edit(Self::listen(cx, move |this, window, cx| {
                 if !matches!(this.editor, Some(EditorDialog::Keys { .. })) {

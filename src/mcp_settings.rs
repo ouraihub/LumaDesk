@@ -112,12 +112,24 @@ impl McpSettings {
             enabled: self.enabled,
             trusted: self.trusted,
         };
-        if let Err(error) = config.validate_url() {
-            self.status = error.to_string();
-            return;
-        }
-        if self.servers.iter().any(|server| server.url == config.url) {
-            self.status = "服务器已存在".into();
+        let rejected = if config.validate_url().is_err() {
+            Some(task::Failure::failed(
+                "SETTINGS_MCP_INVALID_URL",
+                "服务器地址无效：仅允许 HTTPS 或回环 HTTP，且不得包含凭据（SETTINGS_MCP_INVALID_URL）",
+            ))
+        } else if self.servers.iter().any(|server| server.url == config.url) {
+            Some(task::Failure::failed(
+                "SETTINGS_MCP_DUPLICATE",
+                "服务器已存在（SETTINGS_MCP_DUPLICATE）",
+            ))
+        } else {
+            None
+        };
+        if let Some(error) = rejected {
+            let (trace, root) = TraceContext::root("settings.mcp.add", "ui");
+            self.status = error.notice(&trace);
+            self.diagnostic_trace = Some(trace.trace_id().to_owned());
+            task::end(root, &Err::<(), _>(error));
             return;
         }
         let mut next = self.servers.clone();

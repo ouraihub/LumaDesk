@@ -103,8 +103,16 @@ pub(crate) struct Appearance {
 
 impl Appearance {
     pub(crate) fn load(root: &Path) -> Result<Self, String> {
-        let catalog =
-            ThemeCatalog::bundled().map_err(|error| format!("内置主题无法加载：{error}"))?;
+        crate::settings_task::action(
+            "settings.appearance.load",
+            "SETTINGS_APPEARANCE_LOAD_FAILED",
+            "无法读取外观配置；请检查格式、版本或目录权限，原配置未修改",
+            || Self::load_saved(root),
+        )
+    }
+
+    fn load_saved(root: &Path) -> Result<Self, String> {
+        let catalog = ThemeCatalog::bundled().map_err(|_| "内置主题无法加载".to_owned())?;
         let saved = match settings_store::load_appearance(root)? {
             Some(value) => decode(value)?,
             None => {
@@ -134,13 +142,17 @@ impl Appearance {
         })
     }
     fn save(&mut self, next: Preferences) -> Result<(), String> {
-        settings_store::save_appearance(
-            &self.root,
-            &serde_json::to_value(&next).map_err(|_| "外观设置序列化失败".to_owned())?,
-        )
-        .map_err(|_| {
-            "保存外观失败；请检查目录权限或磁盘空间。原设置保持不变，可重新选择重试".to_owned()
-        })?;
+        crate::settings_task::action(
+            "settings.appearance.save",
+            "SETTINGS_APPEARANCE_SAVE_FAILED",
+            "保存外观失败；请检查目录权限或磁盘空间。原设置保持不变，可重试",
+            || {
+                settings_store::save_appearance(
+                    &self.root,
+                    &serde_json::to_value(&next).map_err(|_| "外观设置序列化失败".to_owned())?,
+                )
+            },
+        )?;
         self.saved = next;
         Ok(())
     }
@@ -164,11 +176,20 @@ impl Render for Appearance {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let this = cx.entity().downgrade();
         AppearancePage::new(self.catalog, self.saved.clone(), move |next, window, cx| {
-            let _ = this.update(cx, |this, cx| this.choose(next, window, cx));
+            if this
+                .update(cx, |this, cx| this.choose(next, window, cx))
+                .is_err()
+            {
+                tracing::debug!(reason = "view_closed", "settings.appearance.discarded");
+            }
         })
         .error(self.error.clone())
     }
 }
+
+#[cfg(test)]
+#[path = "theme_diagnostics_tests.rs"]
+mod diagnostics_tests;
 
 #[cfg(test)]
 mod tests {

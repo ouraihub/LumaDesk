@@ -22,6 +22,9 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 tokio = { version = "1", features = ["rt-multi-thread", "time", "net"] }
 futures-util = "0.3"
 
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
 [profile.release]
 lto = true
 codegen-units = 1

@@ -1,5 +1,7 @@
 //! Independent provider, credential and preference commits.
 use super::*;
+use crate::settings_task::{self as task, Failure};
+use lumakit_observability::TraceContext;
 impl SearchSettings {
     pub(super) fn choose_provider(
         &mut self,
@@ -19,13 +21,19 @@ impl SearchSettings {
         if old == index {
             return;
         }
+        let (trace, root) = TraceContext::root("settings.search.default.save", "ui");
+        let _entered = root.span().clone().entered();
         let mut next = self.stored.clone();
         if fetch {
             next.default_fetch = next.configs[index].provider;
         } else {
             next.default_search = next.configs[index].provider;
         }
-        match next.save(&self.root) {
+        let result = next.save_traced(&self.root, &trace);
+        task::end(root, &result);
+        self.card_diagnostic_trace[old] =
+            result.as_ref().err().map(|_| trace.trace_id().to_owned());
+        match result {
             Ok(()) => {
                 self.clear_provider(old, window, cx);
                 self.stored = next;
@@ -36,7 +44,7 @@ impl SearchSettings {
                 }
             }
             Err(error) => {
-                self.card_status[old] = error;
+                self.card_status[old] = error.notice(&trace);
                 self.card_error[old] = true;
             }
         }
@@ -45,59 +53,101 @@ impl SearchSettings {
     /// Commits one provider: `None` saves the card (address, Basic username) and never touches
     /// credentials; `Some` changes credentials only, never unfinished address drafts.
     pub(super) fn save(&mut self, index: usize, action: Option<KeyAction>) -> Result<(), String> {
-        let mut next = self.stored.clone();
-        let config = &mut next.configs[index];
-        let mut clear_credential = false;
-        match action {
-            None => {
-                let endpoint = self.drafts[index].endpoint.trim();
-                config.endpoint = if endpoint.is_empty() {
-                    config.provider.endpoint().into()
-                } else {
-                    endpoint.into()
-                };
-                config.username = self.drafts[index].username.trim().into();
-            }
-            Some(KeyAction::Delete(id)) => {
-                config.keys.retain(|key| key.id != id);
-                if config.selected_key.as_ref() == Some(&id) {
-                    config.selected_key = config.keys.first().map(|key| key.id.clone());
+        let (trace, root) = TraceContext::root(
+            if action.is_some() {
+                "settings.search.credentials.save"
+            } else {
+                "settings.search.config.save"
+            },
+            "ui",
+        );
+        let _entered = root.span().clone().entered();
+        let result = self.save_with_trace(index, action, &trace);
+        task::end(root, &result);
+        self.card_diagnostic_trace[index] =
+            result.as_ref().err().map(|_| trace.trace_id().to_owned());
+        result.map_err(|error| error.notice(&trace))
+    }
+    pub(super) fn save_with_trace(
+        &mut self,
+        index: usize,
+        action: Option<KeyAction>,
+        trace: &TraceContext,
+    ) -> Result<(), Failure> {
+        let invalid = |message| Failure::failed("SETTINGS_INVALID_INPUT", message);
+        let (next, clear_credential) = (|| {
+            let mut next = self.stored.clone();
+            let config = &mut next.configs[index];
+            let mut clear_credential = false;
+            match action {
+                None => {
+                    let endpoint = self.drafts[index].endpoint.trim();
+                    config.endpoint = if endpoint.is_empty() {
+                        config.provider.endpoint().into()
+                    } else {
+                        endpoint.into()
+                    };
+                    config.username = self.drafts[index].username.trim().into();
                 }
-            }
-            Some(KeyAction::Replace(id, value)) => {
-                let value = zeroize::Zeroizing::new(value);
-                let label = normalize_key_label(&self.drafts[index].label)?.map(str::to_owned);
-                let key = config
-                    .keys
-                    .iter_mut()
-                    .find(|key| key.id == id)
-                    .ok_or("密钥不存在")?;
-                if !value.trim().is_empty() {
-                    validate_key(&value)?;
-                    key.replace(value.trim())?;
+                Some(KeyAction::Delete(id)) => {
+                    config.keys.retain(|key| key.id != id);
+                    if config.selected_key.as_ref() == Some(&id) {
+                        config.selected_key = config.keys.first().map(|key| key.id.clone());
+                    }
                 }
-                key.label = label;
-                clear_credential = true;
-            }
-            Some(KeyAction::Add) => {
-                let label = normalize_key_label(&self.drafts[index].label)?.map(str::to_owned);
-                add_key(config, &self.drafts[index].key)?;
-                if let Some(key) = config.keys.last_mut() {
+                Some(KeyAction::Replace(id, value)) => {
+                    let value = zeroize::Zeroizing::new(value);
+                    let label = normalize_key_label(&self.drafts[index].label)
+                        .map_err(invalid)?
+                        .map(str::to_owned);
+                    let key = config
+                        .keys
+                        .iter_mut()
+                        .find(|key| key.id == id)
+                        .ok_or_else(|| invalid("密钥不存在".to_owned()))?;
+                    if !value.trim().is_empty() {
+                        validate_key(&value).map_err(invalid)?;
+                        key.replace(value.trim()).map_err(|_| {
+                            Failure::failed(
+                                "SETTINGS_SECRET_FAILED",
+                                "系统无法加密密钥，原凭据未修改",
+                            )
+                        })?;
+                    }
                     key.label = label;
+                    clear_credential = true;
                 }
-                clear_credential = true;
+                Some(KeyAction::Add) => {
+                    let label = normalize_key_label(&self.drafts[index].label)
+                        .map_err(invalid)?
+                        .map(str::to_owned);
+                    validate_key(&self.drafts[index].key).map_err(invalid)?;
+                    if config.keys.len() >= 16 {
+                        return Err(invalid("每个服务商最多 16 个密钥".to_owned()));
+                    }
+                    add_key(config, &self.drafts[index].key).map_err(|_| {
+                        Failure::failed(
+                            "SETTINGS_SECRET_FAILED",
+                            "系统无法创建或加密密钥，原凭据未修改",
+                        )
+                    })?;
+                    if let Some(key) = config.keys.last_mut() {
+                        key.label = label;
+                    }
+                    clear_credential = true;
+                }
+                Some(KeyAction::SetEnabled(id, enabled)) => {
+                    config
+                        .keys
+                        .iter_mut()
+                        .find(|key| key.id == id)
+                        .ok_or_else(|| invalid("密钥不存在".to_owned()))?
+                        .enabled = enabled;
+                }
             }
-            Some(KeyAction::SetEnabled(id, enabled)) => {
-                config
-                    .keys
-                    .iter_mut()
-                    .find(|key| key.id == id)
-                    .ok_or("密钥不存在")?
-                    .enabled = enabled;
-            }
-        }
-        next.save(&self.root)
-            .map_err(|error| format!("保存失败：{error}；草稿和原凭据均已保留"))?;
+            Ok::<_, Failure>((next, clear_credential))
+        })()?;
+        next.save_traced(&self.root, trace)?;
         self.stored = next;
         if clear_credential {
             self.drafts[index].key.zeroize();
@@ -156,7 +206,11 @@ impl SearchSettings {
         self.drafts[index].key = value.as_str().to_owned();
         if self.drafts[index].editing.is_none() && value.trim().is_empty() {
             if self.key_dialog == Some(index) {
-                self.report(index, Err("密钥不能为空，原凭据未修改".into()), "");
+                let (trace, root) = TraceContext::root("settings.search.credentials.save", "ui");
+                let error = Failure::failed("SETTINGS_INVALID_INPUT", "密钥不能为空，原凭据未修改");
+                task::end(root, &Err::<(), _>(error.clone()));
+                self.card_diagnostic_trace[index] = Some(trace.trace_id().to_owned());
+                self.report(index, Err(error.notice(&trace)), "");
             }
             return;
         }
@@ -169,7 +223,6 @@ impl SearchSettings {
         self.drafts[index].submitted = true;
     }
     fn report(&mut self, index: usize, result: Result<(), String>, success: &str) -> bool {
-        self.card_diagnostic_trace[index] = None;
         self.card_error[index] = result.is_err();
         self.card_status[index] = result
             .as_ref()
@@ -180,6 +233,8 @@ impl SearchSettings {
         let Some(inputs) = &self.inputs else {
             return;
         };
+        let (trace, root) = TraceContext::root("settings.search.preferences.save", "ui");
+        let _entered = root.span().clone().entered();
         let result = (|| {
             let mut preferences = self.preferences.clone();
             preferences.max_results = inputs
@@ -200,12 +255,20 @@ impl SearchSettings {
             let mut next = self.stored.clone();
             next.preferences = preferences_from_draft(&preferences, &text)?;
             next.compression = self.compression;
-            next.save(&self.root)?;
+            validate_stored(&next)?;
+            Ok::<_, String>(next)
+        })()
+        .map_err(|message| Failure::failed("SETTINGS_INVALID_INPUT", message));
+        let result = result.and_then(|next| {
+            next.save_traced(&self.root, &trace)?;
             self.preferences = next.preferences.clone();
             self.blacklist = self.preferences.blacklist.join("\n");
             self.stored = next;
-            Ok::<_, String>(())
-        })();
-        self.status = result.map_or_else(|error| error, |()| "高级设置已保存".into());
+            Ok(())
+        });
+        task::end(root, &result);
+        self.diagnostic_trace = result.as_ref().err().map(|_| trace.trace_id().to_owned());
+        self.status =
+            result.map_or_else(|error| error.notice(&trace), |()| "高级设置已保存".into());
     }
 }

@@ -60,8 +60,27 @@ impl Stored {
         validate_stored(&value)?;
         Ok(value)
     }
+    pub(super) fn save_traced(
+        &self,
+        root: &Path,
+        trace: &lumakit_observability::TraceContext,
+    ) -> Result<(), crate::settings_task::Failure> {
+        validate_stored(self).map_err(|message| {
+            crate::settings_task::Failure::failed("SETTINGS_INVALID_INPUT", message)
+        })?;
+        crate::settings_task::sync(
+            trace,
+            "settings.search.store.save",
+            "SETTINGS_STORE_WRITE_FAILED",
+            || self.persist(root),
+        )
+    }
+    #[cfg(test)]
     pub(super) fn save(&self, root: &Path) -> Result<(), String> {
         validate_stored(self)?;
+        self.persist(root)
+    }
+    fn persist(&self, root: &Path) -> Result<(), String> {
         settings_store::save_search(
             root,
             &SearchData {

@@ -1,4 +1,6 @@
 use super::*;
+use crate::settings_task::{self as task, Failure};
+use lumakit_observability::TraceContext;
 
 impl ModelSettings {
     pub(super) fn open_editor(
@@ -69,12 +71,24 @@ impl ModelSettings {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
+        let (trace, root) = TraceContext::root(
+            match &editor {
+                EditorDialog::Provider { .. } => "settings.provider.save",
+                EditorDialog::Endpoint { .. } => "settings.endpoint.save",
+                EditorDialog::Model { .. } => "settings.model.save",
+                EditorDialog::Keys { .. } => "settings.keys.save",
+            },
+            "ui",
+        );
+        let _entered = root.span().clone().entered();
         if let EditorDialog::Model { value, .. } = &mut editor
             && let Some(model) = &self.view.as_ref().unwrap().model
         {
             if let Err(error) = model.read(cx).validate() {
-                self.report(Err(error), "");
+                let result = Err::<(), _>(Failure::failed("SETTINGS_INPUT_INVALID", error));
+                self.report_task(&trace, &result, "");
                 self.editor = Some(editor);
+                task::end(root, &result);
                 return;
             }
             *value = model.read(cx).value.clone();
@@ -82,8 +96,11 @@ impl ModelSettings {
         let before = self.draft.clone();
         let provider = self.provider.clone();
         let endpoint = self.endpoint.clone();
-        let result = self.apply_editor(&editor).and_then(|_| self.save());
-        if self.report(result, "已保存") {
+        let result = self
+            .apply_editor(&editor)
+            .map_err(|message| Failure::failed("SETTINGS_INPUT_INVALID", message))
+            .and_then(|_| self.save_in(&trace));
+        if self.report_task(&trace, &result, "已保存") {
             self.close_editor(window, cx);
             self.refresh_endpoint(window, cx);
         } else {
@@ -92,6 +109,7 @@ impl ModelSettings {
             self.endpoint = endpoint;
             self.editor = Some(editor);
         }
+        task::end(root, &result);
     }
     pub(super) fn save_key_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.submit_key() {
@@ -100,6 +118,17 @@ impl ModelSettings {
         }
     }
     pub(super) fn delete_confirmed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (trace, root) = TraceContext::root(
+            if self.delete_key.is_some() {
+                "settings.keys.delete"
+            } else if self.delete_endpoint.is_some() {
+                "settings.endpoint.delete"
+            } else {
+                "settings.provider.delete"
+            },
+            "ui",
+        );
+        let _entered = root.span().clone().entered();
         let before = self.draft.clone();
         if let Some(id) = &self.delete_provider {
             self.draft.providers.retain(|p| p.id != *id);
@@ -136,13 +165,13 @@ impl ModelSettings {
                         .map(|e| (p, e))
                 });
             match indices {
-                Some((p, e)) => self.persist_keys(p, e),
-                None => Err("线路已不存在".into()),
+                Some((p, e)) => self.persist_keys(&trace, p, e),
+                None => Err(Failure::failed("SETTINGS_TARGET_MISSING", "线路已不存在")),
             }
         } else {
-            self.save()
+            self.save_in(&trace)
         };
-        if self.report(result, "已删除") {
+        if self.report_task(&trace, &result, "已删除") {
             self.delete_provider = None;
             self.delete_endpoint = None;
             self.delete_key = None;
@@ -151,6 +180,7 @@ impl ModelSettings {
         } else {
             self.draft = before;
         }
+        task::end(root, &result);
     }
     pub(super) fn edit_models(
         &mut self,
@@ -163,15 +193,18 @@ impl ModelSettings {
         if self.job.is_some() {
             return;
         }
+        let (trace, root) = TraceContext::root("settings.models.edit", "ui");
+        let _entered = root.span().clone().entered();
         let endpoint = &mut self.draft.providers[p].endpoints[e];
         if let Some(id) = selected {
             endpoint.selected_model = Some(id);
         }
         endpoint.models.retain(|m| !removed.contains(&m.id));
         repair_model_selection(endpoint);
-        let result = self.save();
-        if !self.report(result, "已保存") {
+        let result = self.save_in(&trace);
+        if !self.report_task(&trace, &result, "已保存") {
             self.draft.providers[p] = before;
         }
+        task::end(root, &result);
     }
 }

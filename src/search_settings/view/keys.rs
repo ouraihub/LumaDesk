@@ -241,12 +241,30 @@ impl SearchSettings {
     }
 
     fn reveal_key(&mut self, index: usize, id: &str, copy: bool, cx: &mut Context<Self>) {
+        let (trace, root) = lumakit_observability::TraceContext::root(
+            if copy {
+                "settings.search.credentials.copy"
+            } else {
+                "settings.search.credentials.reveal"
+            },
+            "ui",
+        );
+        let _entered = root.span().clone().entered();
         let result = self.stored.configs[index]
             .keys
             .iter()
             .find(|key| key.id == id)
             .ok_or("密钥不存在".to_owned())
             .and_then(SavedKey::open);
+        let result = result.map_err(|_| {
+            crate::settings_task::Failure::failed(
+                "SETTINGS_SECRET_FAILED",
+                "无法读取密钥，请在原 Windows 用户下运行或重新填写",
+            )
+        });
+        crate::settings_task::end(root, &result);
+        self.card_diagnostic_trace[index] =
+            result.as_ref().err().map(|_| trace.trace_id().to_owned());
         match result {
             Ok(value) => {
                 if copy {
@@ -262,7 +280,7 @@ impl SearchSettings {
                 }
             }
             Err(error) => {
-                self.card_status[index] = error;
+                self.card_status[index] = error.notice(&trace);
                 self.card_error[index] = true;
             }
         }

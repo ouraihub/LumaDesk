@@ -16,6 +16,9 @@ use zeroize::Zeroize;
 
 mod catalog;
 mod inputs;
+#[cfg(test)]
+mod lifecycle_tests;
+mod loading;
 mod network;
 mod persistence;
 mod stored;
@@ -170,77 +173,12 @@ impl SearchSettings {
         Ok(cx.new(|cx| this.with_inputs(window, cx)))
     }
     fn load(root: &Path) -> Result<Self, String> {
-        let mut stored = match settings_store::load_search(root)? {
-            Some(data) => Stored::from_database(data)?,
-            None => {
-                let value = match lumakit_support::load_versioned::<Stored>(&root.join(FILE), 1)
-                    .map_err(|_| "无法读取网络搜索设置；原文件未修改".to_owned())?
-                {
-                    Some((1, value)) => value,
-                    Some(_) => return Err("网络搜索设置版本不受支持；未覆盖原文件".into()),
-                    None => Stored::default(),
-                };
-                value.save(root)?;
-                value
-            }
-        };
-        // Add only newly supported providers; missing legacy rows remain a corruption error.
-        let mut added = false;
-        for provider in PROVIDERS {
-            if !stored
-                .configs
-                .iter()
-                .any(|config| config.provider == provider)
-            {
-                stored.configs.push(Config {
-                    provider,
-                    endpoint: provider.endpoint().into(),
-                    keys: Vec::new(),
-                    username: String::new(),
-                    selected_key: None,
-                });
-                added = true;
-            }
-        }
-        if added {
-            stored.save(root)?;
-        }
-        let search_index = stored
-            .configs
-            .iter()
-            .position(|c| c.provider == stored.default_search)
-            .ok_or("缺少默认搜索配置")?;
-        let fetch_index = stored
-            .configs
-            .iter()
-            .position(|c| c.provider == stored.default_fetch)
-            .ok_or("缺少默认读取配置")?;
-        let count = stored.configs.len();
-        Ok(Self {
-            root: root.into(),
-            drafts: stored.configs.iter().map(Draft::new).collect(),
-            preferences: stored.preferences.clone(),
-            compression: stored.compression,
-            blacklist: stored.preferences.blacklist.join("\n"),
-            stored,
-            search_index,
-            fetch_index,
-            query: String::new(),
-            target: String::new(),
-            result: None,
-            page: None,
-            status: String::new(),
-            job: None,
-            diagnostic_trace: None,
-            card_diagnostic_trace: vec![None; count],
-            inputs: None,
-            advanced: false,
-            delete_key: None,
-            key_dialog: None,
-            card_status: vec![String::new(); count],
-            card_error: vec![false; count],
-            previous_focus: None,
-        })
+        let (trace, guard) =
+            lumakit_observability::TraceContext::root("settings.search.load", "ui");
+        let _entered = guard.span().clone().entered();
+        let result = Self::load_traced(root, &trace);
+        crate::settings_task::end(guard, &result);
+        result.map_err(|error| error.notice(&trace))
     }
     fn cancel_and_clear(&mut self) {
         for draft in &mut self.drafts {
@@ -251,10 +189,6 @@ impl SearchSettings {
         if let Some(job) = &mut self.job {
             job.cancel.cancel();
             job.discard = true;
-            if let Some(index) = job.check {
-                self.card_status[index] = "已取消".into();
-                self.card_error[index] = false;
-            }
         }
     }
     pub fn clear_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -313,20 +247,15 @@ impl SearchSettings {
         let (trace, root) =
             lumakit_observability::TraceContext::root("settings.search.check", "ui");
         let _entered = root.span().clone().entered();
-        let saved = crate::settings_task::sync(
-            &trace,
-            "settings.search.save",
-            "SETTINGS_STORE_WRITE_FAILED",
-            || {
-                if self.submit_card(index, cx) {
-                    Ok(())
-                } else {
-                    Err(self.card_status[index].clone())
-                }
-            },
-        );
+        if let Some(inputs) = &self.inputs {
+            let input = &inputs.providers[index];
+            self.drafts[index].endpoint = input.endpoint.read(cx).value().to_string();
+            self.drafts[index].username = input.username.read(cx).value().to_string();
+        }
+        let saved = self.save_with_trace(index, None, &trace);
         if let Err(error) = saved {
             self.card_status[index] = error.notice(&trace);
+            self.card_error[index] = true;
             self.card_diagnostic_trace[index] = Some(trace.trace_id().to_owned());
             crate::settings_task::end(root, &Err::<(), _>(error));
             cx.notify();
@@ -344,8 +273,8 @@ impl Drop for SearchSettings {
     fn drop(&mut self) {
         self.cancel_and_clear();
         if let Some(job) = self.job.take() {
-            let _ = job.thread.join();
-            job.root.cancel("settings_closed");
+            let result = worker::complete_job(job, Some("settings_closed"));
+            drop(result);
         }
     }
 }

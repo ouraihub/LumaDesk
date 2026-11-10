@@ -1,24 +1,31 @@
 //! Provider, endpoint and credential draft editing.
 use super::*;
+use crate::settings_task::{self as task, Failure};
+use lumakit_observability::TraceContext;
 impl ModelSettings {
     pub(super) fn set_key_enabled(&mut self, p: usize, e: usize, id: &str, enabled: bool) {
         if self.job.is_some() {
             return;
         }
-        let Some(index) = self.draft.providers[p].endpoints[e]
+        let (trace, root) = TraceContext::root("settings.keys.enabled", "ui");
+        let _entered = root.span().clone().entered();
+        let index = self.draft.providers[p].endpoints[e]
             .keys
             .iter()
-            .position(|key| key.id == id)
-        else {
-            self.report(Err("密钥已不存在".into()), "");
-            return;
+            .position(|key| key.id == id);
+        let result = if let Some(index) = index {
+            let before = self.draft.providers[p].endpoints[e].keys[index].enabled;
+            self.draft.providers[p].endpoints[e].keys[index].enabled = enabled;
+            let result = self.persist_keys(&trace, p, e);
+            if result.is_err() {
+                self.draft.providers[p].endpoints[e].keys[index].enabled = before;
+            }
+            result
+        } else {
+            Err(Failure::failed("SETTINGS_TARGET_MISSING", "密钥已不存在"))
         };
-        let before = self.draft.providers[p].endpoints[e].keys[index].enabled;
-        self.draft.providers[p].endpoints[e].keys[index].enabled = enabled;
-        let result = self.persist_keys(p, e);
-        if !self.report(result, "密钥启用状态已保存") {
-            self.draft.providers[p].endpoints[e].keys[index].enabled = before;
-        }
+        self.report_task(&trace, &result, "密钥启用状态已保存");
+        task::end(root, &result);
     }
     pub(super) fn key_target(&self) -> Option<(usize, usize)> {
         if let Some(EditorDialog::Keys { provider, endpoint }) = &self.editor {
@@ -69,89 +76,117 @@ impl ModelSettings {
     }
 
     pub(super) fn reveal_key(&mut self, p: usize, e: usize, key_id: &str) {
+        let (trace, root) = TraceContext::root("settings.keys.reveal", "ui");
+        let _entered = root.span().clone().entered();
         let endpoint = &self.draft.providers[p].endpoints[e];
         let result = endpoint
             .keys
             .iter()
             .find(|key| key.id == key_id)
-            .ok_or_else(|| "密钥已不存在".to_owned())
-            .and_then(SavedKey::open);
-        let endpoint_id = endpoint.id.clone();
-        let draft = self.key_drafts.entry(endpoint_id.clone()).or_default();
+            .ok_or_else(|| Failure::failed("SETTINGS_TARGET_MISSING", "密钥已不存在"))
+            .and_then(|key| {
+                task::sync(
+                    &trace,
+                    "settings.keys.secret.open",
+                    "SETTINGS_SECRET_FAILED",
+                    || key.open().map_err(|_| "无法解密密钥；原凭据未修改".into()),
+                )
+            });
+        let draft = self.key_drafts.entry(endpoint.id.clone()).or_default();
         draft.revealed = None;
         draft.revealed_key = None;
-        match result {
-            Ok(secret) => {
-                let draft = self.key_drafts.entry(endpoint_id).or_default();
-                draft.revealed = Some(secret);
-                draft.revealed_key = Some(key_id.into());
-            }
-            Err(error) => {
-                self.report(Err(error), "");
-            }
+        self.report_task(&trace, &result, "已显示密钥");
+        let outcome = result.as_ref().map(|_| ()).map_err(Clone::clone);
+        if let Ok(secret) = result {
+            let draft = self
+                .key_drafts
+                .entry(self.draft.providers[p].endpoints[e].id.clone())
+                .or_default();
+            draft.revealed = Some(secret);
+            draft.revealed_key = Some(key_id.into());
         }
+        task::end(root, &outcome);
     }
 
     pub(super) fn save_key(&mut self, p: usize, e: usize) {
+        let (trace, root) = TraceContext::root("settings.keys.save", "ui");
+        let _entered = root.span().clone().entered();
         let endpoint_id = self.draft.providers[p].endpoints[e].id.clone();
-        let draft = self.key_drafts.entry(endpoint_id.clone()).or_default();
-        let value = Zeroizing::new(draft.value.trim().to_owned());
-        let editing = draft.editing.clone();
-        let label = match normalize_key_label(&draft.label) {
-            Ok(label) => label.map(str::to_owned),
-            Err(error) => {
-                self.report(Err(error), "");
-                return;
-            }
-        };
         let original_keys = self.draft.providers[p].endpoints[e].keys.clone();
         let original_selection = self.draft.providers[p].endpoints[e].selected_key.clone();
-        let endpoint = &mut self.draft.providers[p].endpoints[e];
-        let result = if let Some(id) = editing {
-            endpoint
-                .keys
-                .iter_mut()
-                .find(|key| key.id == id)
-                .ok_or_else(|| "待修改密钥已不存在".to_owned())
-                .and_then(|key| {
-                    if !value.is_empty() {
-                        key.replace(&value)?;
-                    }
-                    key.label = label;
-                    Ok(())
-                })
-        } else if value.is_empty() {
-            Err("密钥不能为空，原凭据未修改".into())
-        } else if endpoint.keys.len() >= MAX_KEYS {
-            Err("每条线路最多保存 16 个密钥".into())
-        } else {
-            SavedKey::new(&value).map(|mut key| {
+        let result = (|| {
+            let draft = self.key_drafts.entry(endpoint_id.clone()).or_default();
+            let value = Zeroizing::new(draft.value.trim().to_owned());
+            if !value.is_empty() && (value.len() > 4096 || value.chars().any(char::is_control)) {
+                return Err(Failure::failed(
+                    "SETTINGS_INPUT_INVALID",
+                    "密钥不能含控制字符，且不能超过 4096 字节",
+                ));
+            }
+            let editing = draft.editing.clone();
+            let label = normalize_key_label(&draft.label)
+                .map_err(|message| Failure::failed("SETTINGS_INPUT_INVALID", message))?
+                .map(str::to_owned);
+            let endpoint = &mut self.draft.providers[p].endpoints[e];
+            if let Some(id) = editing {
+                let key = endpoint
+                    .keys
+                    .iter_mut()
+                    .find(|key| key.id == id)
+                    .ok_or_else(|| {
+                        Failure::failed("SETTINGS_TARGET_MISSING", "待修改密钥已不存在")
+                    })?;
+                if !value.is_empty() {
+                    task::sync(
+                        &trace,
+                        "settings.keys.secret.replace",
+                        "SETTINGS_SECRET_FAILED",
+                        || {
+                            key.replace(&value)
+                                .map_err(|_| "无法加密密钥；原凭据未修改".into())
+                        },
+                    )?;
+                }
+                key.label = label;
+            } else {
+                if value.is_empty() {
+                    return Err(Failure::failed(
+                        "SETTINGS_INPUT_INVALID",
+                        "密钥不能为空，原凭据未修改",
+                    ));
+                }
+                if endpoint.keys.len() >= MAX_KEYS {
+                    return Err(Failure::failed(
+                        "SETTINGS_INPUT_INVALID",
+                        "每条线路最多保存 16 个密钥",
+                    ));
+                }
+                let mut key = task::sync(
+                    &trace,
+                    "settings.keys.secret.create",
+                    "SETTINGS_SECRET_FAILED",
+                    || SavedKey::new(&value).map_err(|_| "无法加密密钥；原凭据未修改".into()),
+                )?;
                 key.label = label;
                 if endpoint.selected_key.is_none() {
                     endpoint.selected_key = Some(key.id.clone());
                 }
                 endpoint.keys.push(key);
-            })
-        };
-        match result {
-            Ok(()) => {
-                let result = self.persist_keys(p, e);
-                if self.report(result, "密钥已加密保存") {
-                    let draft = self.key_drafts.get_mut(&endpoint_id).unwrap();
-                    draft.value.zeroize();
-                    draft.label.clear();
-                    draft.editing = None;
-                    draft.revealed = None;
-                    draft.revealed_key = None;
-                } else {
-                    self.draft.providers[p].endpoints[e].keys = original_keys;
-                    self.draft.providers[p].endpoints[e].selected_key = original_selection;
-                }
             }
-            Err(error) => {
-                self.report(Err(error), "");
-            }
+            self.persist_keys(&trace, p, e)
+        })();
+        if self.report_task(&trace, &result, "密钥已加密保存") {
+            let draft = self.key_drafts.get_mut(&endpoint_id).unwrap();
+            draft.value.zeroize();
+            draft.label.clear();
+            draft.editing = None;
+            draft.revealed = None;
+            draft.revealed_key = None;
+        } else {
+            self.draft.providers[p].endpoints[e].keys = original_keys;
+            self.draft.providers[p].endpoints[e].selected_key = original_selection;
         }
+        task::end(root, &result);
     }
 
     pub(super) fn apply_editor(&mut self, editor: &EditorDialog) -> Result<(), String> {

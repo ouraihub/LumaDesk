@@ -11,22 +11,34 @@ use std::{
     },
 };
 
+struct Picker {
+    receiver: mpsc::Receiver<Result<Option<PathBuf>, String>>,
+    thread: std::thread::JoinHandle<()>,
+}
+
 pub struct ChatState {
     pub session: ChatSession,
     pub usage_status: lumakit_usage_status::ContextStatus,
     wake: Arc<AtomicBool>,
-    picker: Option<mpsc::Receiver<Result<Option<PathBuf>, String>>>,
+    picker: Option<Picker>,
 }
 
 impl ChatState {
     pub fn new(root: &Path) -> Result<Self, String> {
         let wake = Arc::new(AtomicBool::new(false));
         let signal = wake.clone();
-        let session = ChatSession::open(
-            &root.join("chat.db"),
-            Arc::new(move || {
-                signal.store(true, Ordering::Release);
-            }),
+        let session = crate::settings_task::action(
+            "chat.load",
+            "CHAT_LOAD_FAILED",
+            "无法读取或迁移聊天记录；请检查权限、配置版本或备份，原文件未覆盖",
+            || {
+                ChatSession::open(
+                    &root.join("chat.db"),
+                    Arc::new(move || {
+                        signal.store(true, Ordering::Release);
+                    }),
+                )
+            },
         )?;
         Ok(Self {
             session,
@@ -61,14 +73,27 @@ impl ChatState {
         let changed = self.wake.swap(false, Ordering::AcqRel);
         let previous_phase = self.session.phase();
         self.session.poll();
-        let result = self.picker.as_ref().map(|picker| picker.try_recv());
+        let result = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.receiver.try_recv());
         let picker_changed = match result {
             Some(Ok(result)) => {
-                self.picker = None;
+                if let Some(picker) = self.picker.take()
+                    && picker.thread.join().is_err()
+                {
+                    tracing::warn!(
+                        code = "ATTACHMENT_PICKER_PANICKED",
+                        "chat.attachment.worker_failed"
+                    );
+                }
                 match result {
                     Ok(Some(path)) => {
-                        if let Err(error) = self.session.add_attachment(&path) {
-                            self.session.report(error);
+                        if self.session.add_attachment(&path).is_err() {
+                            self.report_operation_error(
+                                "chat.attachment.add",
+                                "CHAT_ATTACHMENT_ADD_FAILED",
+                            );
                         }
                     }
                     Ok(None) => {}
@@ -77,7 +102,14 @@ impl ChatState {
                 true
             }
             Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                self.picker = None;
+                if let Some(picker) = self.picker.take()
+                    && picker.thread.join().is_err()
+                {
+                    tracing::warn!(
+                        code = "ATTACHMENT_PICKER_PANICKED",
+                        "chat.attachment.worker_failed"
+                    );
+                }
                 self.session.report("附件选择器意外退出，请重试。".into());
                 true
             }
@@ -104,6 +136,18 @@ impl ChatState {
         }
     }
 
+    fn report_operation_error(&mut self, operation: &'static str, code: &'static str) {
+        if self.session.save_failed() {
+            return;
+        }
+        let (trace, root) = lumakit_observability::TraceContext::root(operation, "ui");
+        root.fail(code);
+        self.session.report(format!(
+            "操作未完成；请检查已保存的模型、配置或当前记录后重试。\n诊断 TraceId：{}",
+            trace.trace_id()
+        ));
+    }
+
     pub fn dispatch(&mut self, action: ChatAction, models: &ModelSettings) -> bool {
         match action {
             ChatAction::New => self.session.new_conversation(),
@@ -116,8 +160,8 @@ impl ChatState {
                     .find(|option| option.model == model)
                     .ok_or_else(|| "聊天模型已失效，请刷新目录后重选。".to_owned())
                     .and_then(|option| self.session.select_model_pair(option, None));
-                if let Err(error) = result {
-                    self.session.report(error);
+                if result.is_err() {
+                    self.report_operation_error("chat.model.select", "CHAT_MODEL_SELECT_FAILED");
                 }
             }
             ChatAction::SelectModelPair { model, effort } => {
@@ -127,8 +171,8 @@ impl ChatState {
                     .find(|option| option.model == model)
                     .ok_or_else(|| "聊天模型已失效，请刷新目录后重选。".to_owned())
                     .and_then(|option| self.session.select_model_pair(option, effort));
-                if let Err(error) = result {
-                    self.session.report(error);
+                if result.is_err() {
+                    self.report_operation_error("chat.model.select", "CHAT_MODEL_SELECT_FAILED");
                 }
             }
             ChatAction::ToggleFavorite(model) => {
@@ -149,8 +193,8 @@ impl ChatState {
                     .find(|option| option.model == model)
                     .ok_or_else(|| "聊天模型已失效，无法设为默认。".to_owned())
                     .and_then(|option| self.session.set_default_model_pair(option, effort));
-                if let Err(error) = result {
-                    self.session.report(error);
+                if result.is_err() {
+                    self.report_operation_error("chat.model.default", "CHAT_MODEL_DEFAULT_FAILED");
                 }
             }
             ChatAction::RefreshModels { .. } => {
@@ -168,21 +212,58 @@ impl ChatState {
                     match std::thread::Builder::new()
                         .name("attachment-picker".into())
                         .spawn(move || {
-                            let _ = sender.send(lumakit_gpui::pick_attachment());
+                            let (trace, root) = lumakit_observability::TraceContext::root(
+                                "chat.attachment.pick",
+                                "ui",
+                            );
+                            let _entered = root.span().clone().entered();
+                            let result = lumakit_gpui::pick_attachment();
+                            let result = match result {
+                                Ok(None) => {
+                                    root.cancel("user_cancelled");
+                                    Ok(None)
+                                }
+                                Ok(path) => {
+                                    root.finish("SELECTED");
+                                    Ok(path)
+                                }
+                                Err(_) => {
+                                    root.fail("CHAT_ATTACHMENT_PICK_FAILED");
+                                    Err(format!(
+                                        "无法选择附件；请检查系统文件选择器。\n诊断 TraceId：{}",
+                                        trace.trace_id()
+                                    ))
+                                }
+                            };
+                            if sender.send(result).is_err() {
+                                tracing::debug!(
+                                    reason = "view_closed",
+                                    "chat.attachment.discarded"
+                                );
+                            }
                             wake.store(true, Ordering::Release);
                         }) {
-                        Ok(_) => self.picker = Some(receiver),
-                        Err(error) => self.session.report(format!("无法打开附件选择器：{error}")),
+                        Ok(thread) => self.picker = Some(Picker { receiver, thread }),
+                        Err(_) => self.report_operation_error(
+                            "chat.attachment.pick",
+                            "CHAT_ATTACHMENT_WORKER_START_FAILED",
+                        ),
                     }
                 }
             }
             ChatAction::RemoveAttachment(id) => self.session.remove_attachment(&id),
             ChatAction::OpenMedia(id) => {
-                if let Err(error) = self
-                    .session
-                    .media_path(&id)
-                    .and_then(|path| lumakit_gpui::open_media(&path))
-                {
+                let result = crate::settings_task::action(
+                    "chat.media.open",
+                    "CHAT_MEDIA_OPEN_FAILED",
+                    "无法打开图片；请检查文件是否存在及系统打开方式",
+                    || {
+                        self.session
+                            .media_path(&id)
+                            .and_then(|path| lumakit_gpui::open_media(&path))
+                    },
+                );
+                if let Err(error) = result {
                     self.session.report(error);
                 }
             }
@@ -194,14 +275,18 @@ impl ChatState {
                 expected_text,
                 next_text,
             } => {
-                if let Err(error) = self.session.edit_attempt(
-                    &conversation_id,
-                    &turn_id,
-                    &attempt_id,
-                    &expected_text,
-                    &next_text,
-                ) {
-                    self.session.report(error);
+                if self
+                    .session
+                    .edit_attempt(
+                        &conversation_id,
+                        &turn_id,
+                        &attempt_id,
+                        &expected_text,
+                        &next_text,
+                    )
+                    .is_err()
+                {
+                    self.report_operation_error("chat.attempt.edit", "CHAT_ATTEMPT_EDIT_FAILED");
                 }
             }
             ChatAction::DeleteAttempt {
@@ -209,11 +294,15 @@ impl ChatState {
                 turn_id,
                 attempt_id,
             } => {
-                if let Err(error) =
-                    self.session
-                        .delete_attempt(&conversation_id, &turn_id, &attempt_id)
+                if self
+                    .session
+                    .delete_attempt(&conversation_id, &turn_id, &attempt_id)
+                    .is_err()
                 {
-                    self.session.report(error);
+                    self.report_operation_error(
+                        "chat.attempt.delete",
+                        "CHAT_ATTEMPT_DELETE_FAILED",
+                    );
                 }
             }
             ChatAction::SelectAttempt {
@@ -221,11 +310,15 @@ impl ChatState {
                 turn_id,
                 attempt_id,
             } => {
-                if let Err(error) =
-                    self.session
-                        .select_attempt(&conversation_id, &turn_id, &attempt_id)
+                if self
+                    .session
+                    .select_attempt(&conversation_id, &turn_id, &attempt_id)
+                    .is_err()
                 {
-                    self.session.report(error);
+                    self.report_operation_error(
+                        "chat.attempt.select",
+                        "CHAT_ATTEMPT_SELECT_FAILED",
+                    );
                 }
             }
             ChatAction::ForkAttempt {
@@ -233,16 +326,20 @@ impl ChatState {
                 turn_id,
                 attempt_id,
             } => {
-                if let Err(error) =
-                    self.session
-                        .fork_attempt(&conversation_id, &turn_id, &attempt_id)
+                if self
+                    .session
+                    .fork_attempt(&conversation_id, &turn_id, &attempt_id)
+                    .is_err()
                 {
-                    self.session.report(error);
+                    self.report_operation_error("chat.attempt.fork", "CHAT_ATTEMPT_FORK_FAILED");
                 }
             }
             ChatAction::CopyConversation { conversation_id } => {
-                if let Err(error) = self.session.copy_conversation(&conversation_id) {
-                    self.session.report(error);
+                if self.session.copy_conversation(&conversation_id).is_err() {
+                    self.report_operation_error(
+                        "chat.conversation.copy",
+                        "CHAT_CONVERSATION_COPY_FAILED",
+                    );
                 }
             }
             ChatAction::Send | ChatAction::Retry => {
@@ -290,7 +387,7 @@ impl ChatState {
                             self.session.send(chat);
                         }
                     }
-                    Err(error) => self.session.report(error),
+                    Err(_) => self.report_operation_error("chat.prepare", "CHAT_PREPARE_FAILED"),
                 }
             }
             ChatAction::RetryWith(model) => {
@@ -310,7 +407,7 @@ impl ChatState {
                             self.session.retry_with(chat);
                         }
                     }
-                    Err(error) => self.session.report(error),
+                    Err(_) => self.report_operation_error("chat.prepare", "CHAT_PREPARE_FAILED"),
                 }
             }
             ChatAction::EditAttempt { .. } => {

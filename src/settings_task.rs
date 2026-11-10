@@ -44,7 +44,11 @@ impl Failure {
         }
     }
     pub(crate) fn notice(&self, trace: &TraceContext) -> String {
-        format!("{self}\n诊断 TraceId：{}", trace.trace_id())
+        format!(
+            "{self}\n错误码：{}\n诊断 TraceId：{}",
+            self.code(),
+            trace.trace_id()
+        )
     }
 }
 impl From<String> for Failure {
@@ -92,6 +96,20 @@ pub(crate) fn sync<T>(
     drop(entered);
     end(guard, &result);
     result
+}
+
+/// A synchronous user operation with a single failure owner and a safe public notice.
+pub(crate) fn action<T>(
+    name: &'static str,
+    code: &'static str,
+    message: &'static str,
+    work: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let (trace, root) = TraceContext::root(name, "ui");
+    let _entered = root.span().clone().entered();
+    let result = sync(&trace, name, code, work).map_err(|_| Failure::failed(code, message));
+    end(root, &result);
+    result.map_err(|error| error.notice(&trace))
 }
 
 /// Own the guard outside the selected future, so cancellation/timeout never drops it unfinished.

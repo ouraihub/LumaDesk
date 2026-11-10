@@ -45,17 +45,22 @@ fn since_ms(range: Range, now: u64) -> Option<u64> {
 
 impl DesktopApp {
     pub(super) fn refresh_usage(&mut self) {
-        self.usage.report = Some((|| {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_err(|_| "无法读取当前时间，请检查系统时间后重试".to_owned())?
-                .as_millis()
-                .try_into()
-                .map_err(|_| "系统时间超出统计范围".to_owned())?;
-            self.chat
-                .session
-                .usage_report(None, since_ms(self.usage.range, now))
-        })());
+        self.usage.report = Some(crate::settings_task::action(
+            "settings.usage.read",
+            "SETTINGS_USAGE_READ_FAILED",
+            "无法读取用量统计；请检查聊天记录数据库与系统时间",
+            || {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map_err(|_| "无法读取当前时间".to_owned())?
+                    .as_millis()
+                    .try_into()
+                    .map_err(|_| "系统时间超出统计范围".to_owned())?;
+                self.chat
+                    .session
+                    .usage_report(None, since_ms(self.usage.range, now))
+            },
+        ));
     }
 
     pub(super) fn usage_page(&self, cx: &Context<Self>) -> AnyElement {

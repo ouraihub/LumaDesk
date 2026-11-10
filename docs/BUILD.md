@@ -66,6 +66,8 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 
 模型目录刷新、检测/同步、搜索检测/读取、MCP 配置保存均显式关联日志；MCP 页面目前不提供网络发现动作。成功/失败/取消/超时验证使用临时 `LUMADESK_DATA_DIR` 与本机回环服务，不发送真实密钥。任务和实测记录见 [LumaKit 日志任务](../../LumaKit/docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md)。
 
+开发规则见[日志与异常规范](日志与异常规范.md)，用户排查见[日志查看与问题排查指南](日志查看与问题排查指南.md)。2026-11-10 复查发现旧 L6/L7 验收未覆盖普通保存、启动失败与 panic；本轮整改与证据单独记录，不能用既有 DONE 推断新规范全覆盖。
+
 ## 模型服务共享界面
 
 服务商栏、详情标题、密钥区、密钥策略、线路区、模型工具栏/分组/行、发现模型行，以及服务商/线路/密钥/模型/发现弹窗的字段、滚动区和页脚统一使用 `lumakit_gpui::providers`。宿主只提供真实业务控件和回调；模型的能力声明、容量、用途、八类模型类型、流式与完整分档价格编辑继续保留，保存原始模型配置，不把来源参考投影写回目录。
@@ -91,6 +93,30 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 2026-11-10 搜索续作验证：`test --locked search_settings` 21 项、`test --locked settings_store` 1 项、fmt 检查及严格 clippy 通过。隔离实窗验证密钥留空只改标签且密文不变、SQLite trigger 保存失败/重试及 Switch 回滚、重启状态、仅第二把启用密钥实际发送、全部停用零网络、回环 HTTP 成功/429/取消与进行中禁用。320/375/414/768 逻辑客户端宽度均已截图检查，管理输入、动作、Switch、关闭可达；日志未包含测试密钥。截图目录 `C:/Users/Administrator/AppData/Local/Temp/search-key-consistency-c63rjq46/`，最终布局为 `search-final-client-*.png`。本节验证的是 `target/debug/luma-desk.exe`，不代表上一节已发布 EXE 已包含本次搜索改动。
 
 搜索版正式发布：源码提交 `443ccd9`，`scripts/build-app.bat` 完整通过（Kit release 195 项、宿主 release 49 项）；构建标识 `0.1.0-5e1a0b554afc473d90b261a27abdbd03`。EXE SHA-256 `fa3a3bec88f5591edd1f47be7c9836ab68d93fdac9b5cc358b12af41cc45bda0`；EXE、ZIP 和包内 EXE 校验通过。新发布 EXE 已用隔离数据实窗打开网络搜索密钥管理，确认标签/密钥输入可访问并正常退出（退出码 0）；隔离目录 `C:/Users/Administrator/AppData/Local/Temp/search-release-u31j_l2q/`。上述 debug 验证范围与此正式发布冒烟分别记录，不将前者视为全部 release 场景重测。
+
+## 2026-11-10 日志与异常规范整改
+
+规范已落入 `docs/日志与异常规范.md`，AGENTS 与工程规范索引接入；排查指南和共享设计同步。共享日志使用同一同步 writer 记录安全 panic ERROR，不调用默认 payload stderr hook；源码位置去开发机绝对前缀，损坏日志级别不再静默默认，flush 传播真实写入失败。HTTP/SSE 错误不回传外部正文，URL/request-id 只保存诊断哈希。
+
+聊天保存失败按类型记录稳定码与真实 TraceId，连续未恢复失败不重复报警；请求提交保存由请求 root 独占 ERROR，最终回答保存失败独立报告并保留内容。`ai.request` 成功结果 `NETWORK_COMPLETED_PENDING_SAVE` 不冒充已持久化。设置加载、普通 CRUD/密钥/启停、搜索偏好、外观和用量查询补最终边界；存储错误只返回安全中文。模型和搜索移除 catch_unwind，panic ERROR 归 hook；join WARN、guard UNFINISHED 保留程序中断。取消/隐藏/关闭只丢弃成功，不覆盖已返回失败；失效结果 DEBUG 记录固定原因。
+
+实际命令均经 `scripts/cargo-msvc.bat`：
+
+| 验证 | 实际结果 |
+| --- | --- |
+| `test --locked` | 宿主63项通过，0失败/ignored；故障writer回归使用独立子进程避免并发subscriber污染 |
+| `test --manifest-path ../LumaKit/Cargo.toml --target-dir ../LumaKit/target -p lumakit-ai --locked` | 单元59、model picker13、chat session40、stream5，共117项通过 |
+| `test ... -p lumakit-observability --locked` / `--test panic_process` | 15项单元通过；独立panic测试通过debug unwind与另编译release panic=abort、字符串/非字符串载荷、Error级别重载、链路及隐私扫描 |
+| 宿主 `clippy --all-targets --locked -- -D warnings`；Kit上述两crate同命令 | 严格clippy通过，无新增lint豁免 |
+| 宿主fmt/check all-targets，Kit两crate fmt check；宿主build | 均通过，实际运行 `target/debug/luma-desk.exe` |
+
+实际程序使用隔离目录 `C:/Users/Administrator/AppData/Local/Temp/lumadesk-logging-fixed-i8ygsrvg/`，不访问真实凭据/供应商。无效外观配置：界面显示安全中文、错误码与TraceId，日志仅一个对应ERROR，未误报app.started。搜索：回环成功、429失败、进行中取消（567ms）、SQLite trigger保存失败和移除trigger重试均操作。模型：新增服务商成功，trigger失败保留名称草稿，修复后再次保存成功。打开后台日志实际观察筛选与诊断控件。观察的16个root均恰有一个终态；测试密钥、SQL故障正文、上游正文、URL路径标记均未出现在日志。截图为 `startup-failed-fixed.png`、`search-{success,failure,running,cancelled,save-failed}.png`、`model-save-failed.png`、`log-view-fixed.png`。
+
+规模评审：启动组合抽至startup128行；main356、宿主chat427、theme399（含测试）、settings_store419（含测试）、model状态306/持久化212/worker303/刷新441、search状态349/持久化274/worker233，均保持单一状态/事务/编排所有者，未新增超过500行模块。Kit诊断127、composer486、generation404，日志lib205/format303/writer182。既有AI lib1140行本轮抽出HTTP失败私有职责，未扩大运行时接口；protocol946行仅收紧四处错误出口，继续拆整个编码/解码状态机将扩大日志修复范围，本次作为具名规模例外，下次修改对应协议职责时继续拆分；两者由AI117项与严格clippy覆盖。
+
+代码引用工具：尝试 rust-analyzer references 时服务器退出（code 0），后续按目标符号与全部调用方搜索核对；未宣称语言服务器引用检查成功。
+
+边界：没有改UI布局，未重测320/375/414/768布局矩阵；没有在实际窗口制造panic或等待AI120秒超时，前者用独立子进程、后者沿既有超时合同与定向回归。未重跑无关Kit crate/Native workspace。此次更新源码与debug运行产物，未重新打包 `dist` 正式EXE；不要把此前发布哈希当作本次修复产物。磁盘不可写、系统强杀、访问违规等仍不能保证Rust日志落盘。
 
 ## 已知问题
 
