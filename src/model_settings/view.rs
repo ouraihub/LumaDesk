@@ -135,13 +135,15 @@ impl ModelSettings {
                                     this.dirty = true;
                                 }
                             }
-                            "name" => match &mut this.editor {
-                                Some(
+                            "name" => {
+                                if let Some(
                                     EditorDialog::Provider { name, .. }
                                     | EditorDialog::Endpoint { name, .. },
-                                ) => *name = value,
-                                _ => {}
-                            },
+                                ) = &mut this.editor
+                                {
+                                    *name = value;
+                                }
+                            }
                             "editor-url" => {
                                 if let Some(EditorDialog::Endpoint { url, .. }) = &mut this.editor {
                                     *url = value;
@@ -300,15 +302,15 @@ impl ModelSettings {
         let Some(mut editor) = self.editor.take() else {
             return;
         };
-        if let EditorDialog::Model { value, .. } = &mut editor {
-            if let Some(model) = &self.view.as_ref().unwrap().model {
-                if let Err(error) = model.read(cx).validate() {
-                    self.report(Err(error), "");
-                    self.editor = Some(editor);
-                    return;
-                }
-                *value = model.read(cx).value.clone();
+        if let EditorDialog::Model { value, .. } = &mut editor
+            && let Some(model) = &self.view.as_ref().unwrap().model
+        {
+            if let Err(error) = model.read(cx).validate() {
+                self.report(Err(error), "");
+                self.editor = Some(editor);
+                return;
             }
+            *value = model.read(cx).value.clone();
         }
         let before = self.draft.clone();
         let provider = self.provider.clone();
@@ -350,18 +352,17 @@ impl ModelSettings {
                 p.endpoints.retain(|e| e.id != *id);
             }
         }
-        if let Some((provider, endpoint, key)) = &self.delete_key {
-            if let Some(endpoint) = self
+        if let Some((provider, endpoint, key)) = &self.delete_key
+            && let Some(endpoint) = self
                 .draft
                 .providers
                 .iter_mut()
                 .find(|p| &p.id == provider)
                 .and_then(|p| p.endpoints.iter_mut().find(|e| &e.id == endpoint))
-            {
-                endpoint.keys.retain(|k| &k.id != key);
-                if endpoint.selected_key.as_ref() == Some(key) {
-                    endpoint.selected_key = endpoint.keys.first().map(|k| k.id.clone());
-                }
+        {
+            endpoint.keys.retain(|k| &k.id != key);
+            if endpoint.selected_key.as_ref() == Some(key) {
+                endpoint.selected_key = endpoint.keys.first().map(|k| k.id.clone());
             }
         }
         let result = if let Some((provider, endpoint, _)) = &self.delete_key {
@@ -390,47 +391,6 @@ impl ModelSettings {
             self.delete_key = None;
             self.repair_selection();
             self.refresh_endpoint(window, cx);
-        } else {
-            self.draft = before;
-        }
-    }
-    fn save_sync(&mut self, selected: HashSet<String>, types: HashMap<String, ModelType>) {
-        let Some(dialog) = &self.sync_dialog else {
-            return;
-        };
-        let before = self.draft.clone();
-        let result = (|| {
-            let endpoint = self
-                .draft
-                .providers
-                .iter_mut()
-                .find(|p| p.id == dialog.provider)
-                .and_then(|p| p.endpoints.iter_mut().find(|e| e.id == dialog.endpoint))
-                .ok_or("目标线路已不存在")?;
-            merge_models(&mut endpoint.models, &dialog.ids, &selected);
-            for model in &mut endpoint.models {
-                if let Some(kind) = types.get(&model.id) {
-                    // A discovery round must not erase manually configured settings on unchanged types.
-                    if model.settings.model_type != *kind {
-                        model.settings.model_type = *kind;
-                        if *kind != ModelType::Chat {
-                            model.settings.reasoning = None;
-                            model.settings.native_web_search = false;
-                            model.settings.pricing = None;
-                            model.settings.supports_tools = None;
-                        }
-                    }
-                }
-            }
-            repair_model_selection(endpoint);
-            Ok::<_, String>(())
-        })()
-        .and_then(|_| self.save());
-        if self.report(result, "模型选择已保存") {
-            if let Some(dialog) = &mut self.sync_dialog {
-                dialog.selected = selected;
-                dialog.types = types;
-            }
         } else {
             self.draft = before;
         }
@@ -1123,6 +1083,21 @@ impl ModelSettings {
                 .flex_wrap()
                 .gap(space::S8)
                 .children(notice.map(|n| div().flex_1().min_w(px(0.)).child(n)))
+                .when_some(
+                    self.diagnostic_trace.clone().filter(|_| self.error),
+                    |d, trace| {
+                        d.child(
+                            Button::new("copy-model-diagnostic")
+                                .small()
+                                .link()
+                                .label("复制诊断 ID")
+                                .accessibility_label(format!("复制诊断 ID {trace}"))
+                                .on_click(move |_, _, cx| {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(trace.clone()))
+                                }),
+                        )
+                    },
+                )
                 .when(retry, |d| {
                     d.child(
                         self.button("retry-save", "重试保存修改", cx, |this, _, _| {

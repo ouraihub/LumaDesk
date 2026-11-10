@@ -1,5 +1,10 @@
 //! Model settings persistence, discovery and selection regressions.
 use super::*;
+fn test_trace() -> lumakit_observability::TraceContext {
+    let (trace, root) = lumakit_observability::TraceContext::root("test.models", "ui");
+    root.finish("REGISTERED");
+    trace
+}
 #[test]
 fn display_name_and_model_type_change_picker_without_changing_wire_id() {
     let mut file = SettingsFile::default();
@@ -235,6 +240,7 @@ fn sync_infers_new_types_but_preserves_saved_model_settings() {
         "gpt-image-custom".into(),
     ]))
     .unwrap();
+    let (trace, guard) = lumakit_observability::TraceContext::root("test.sync", "ui");
     settings.job = Some(Job {
         cancel: CancellationToken::new(),
         thread: std::thread::spawn(|| {}),
@@ -244,6 +250,8 @@ fn sync_infers_new_types_but_preserves_saved_model_settings() {
             endpoint,
         },
         sync: true,
+        trace,
+        root: guard,
     });
     assert!(settings.poll());
     let dialog = settings.sync_dialog.as_ref().unwrap();
@@ -416,7 +424,7 @@ fn actual_loopback_detection_auth_failover_and_encrypted_reload() {
         selected_model: None,
     };
     assert_eq!(
-        detect_models(&endpoint, CancellationToken::new()).unwrap(),
+        detect_models(&endpoint, CancellationToken::new(), &test_trace()).unwrap(),
         vec!["loopback-model"]
     );
     let mut messages = endpoint.clone();
@@ -425,19 +433,22 @@ fn actual_loopback_detection_auth_failover_and_encrypted_reload() {
     messages.keys.remove(0);
     messages.selected_key = None;
     assert_eq!(
-        detect_models(&messages, CancellationToken::new()).unwrap(),
+        detect_models(&messages, CancellationToken::new(), &test_trace()).unwrap(),
         vec!["loopback-model"]
     );
     let mut responses = messages.clone();
     responses.protocol = Protocol::OpenAiResponses;
     responses.base_url = format!("http://{address}/custom/v1");
     assert_eq!(
-        detect_models(&responses, CancellationToken::new()).unwrap(),
+        detect_models(&responses, CancellationToken::new(), &test_trace()).unwrap(),
         vec!["loopback-model"]
     );
     let cancelled = CancellationToken::new();
     cancelled.cancel();
-    assert!(detect_models(&responses, cancelled).is_err());
+    assert!(matches!(
+        detect_models(&responses, cancelled, &test_trace()),
+        Err(crate::settings_task::Failure::Cancelled)
+    ));
     let requests = server.join().unwrap();
     assert!(requests[0].starts_with("GET /v1/models "));
     assert!(
@@ -568,16 +579,20 @@ fn bounded_response_and_pending_request_cancellation() {
         selected_model: None,
     };
     assert!(
-        detect_models(&endpoint, CancellationToken::new())
+        detect_models(&endpoint, CancellationToken::new(), &test_trace())
             .unwrap_err()
+            .to_string()
             .contains("2 MiB")
     );
     let cancel = CancellationToken::new();
     let worker_cancel = cancel.clone();
-    let worker = std::thread::spawn(move || detect_models(&endpoint, worker_cancel));
+    let worker = std::thread::spawn(move || detect_models(&endpoint, worker_cancel, &test_trace()));
     accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
     cancel.cancel();
-    assert!(worker.join().unwrap().unwrap_err().contains("取消"));
+    assert!(matches!(
+        worker.join().unwrap(),
+        Err(crate::settings_task::Failure::Cancelled)
+    ));
     release_tx.send(()).unwrap();
     server.join().unwrap();
 }
@@ -627,7 +642,7 @@ fn anthropic_two_page_catalog_uses_same_origin_and_auth() {
         selected_model: None,
     };
     assert_eq!(
-        detect_models(&endpoint, CancellationToken::new()).unwrap(),
+        detect_models(&endpoint, CancellationToken::new(), &test_trace()).unwrap(),
         vec!["page-one", "page-two"]
     );
     let requests = server.join().unwrap();
@@ -690,9 +705,9 @@ fn unauthorized_without_saved_key_says_save_the_key_first() {
         selected_key: None,
         selected_model: None,
     };
-    let error = detect_models(&endpoint, CancellationToken::new()).unwrap_err();
+    let error = detect_models(&endpoint, CancellationToken::new(), &test_trace()).unwrap_err();
     assert!(
-        error.contains("没有已保存的密钥") && error.contains("401"),
+        error.to_string().contains("没有已保存的密钥") && error.to_string().contains("401"),
         "{error}"
     );
     assert!(
@@ -851,6 +866,9 @@ fn picker_force_refresh_uses_http_and_preserves_failed_catalog_and_manual_metada
             .catalog_refresh_notice()
             .contains("[catalog_endpoint]")
     );
+    let diagnostic = settings.catalog_refresh_trace_id().unwrap();
+    assert_eq!(diagnostic.len(), 32);
+    assert!(settings.catalog_refresh_notice().contains(diagnostic));
     let restored = ModelSettings::load(&root).unwrap();
     assert!(
         restored

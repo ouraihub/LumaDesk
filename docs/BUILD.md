@@ -56,9 +56,15 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 
 ## 格式与 lint 现状
 
-- 现有源码未经 rustfmt 统一（`fmt --check` 有大量差异）。按《AI 工程规范》§11，全仓格式化须单独提交；功能改动只格式化新文件，不重排已有文件。
+- 2026-11-09 日志续作统一运行 rustfmt 后，宿主与 LumaKit 的 `fmt --all -- --check` 均通过；严格 clippy 的旧警告已按等价修复清除，没有新增 lint 屏蔽。
 - LumaKit 定义了 `[workspace.lints]`，但 `lumakit-design`、`lumakit-gpui` 与本项目尚未启用；启用同样单独进行。
 - `gpui-kit/test-support` 在 LumaKit 里无法与 egui 同时解析（会引入 gpui-fast 对 taffy/unicode-properties 的精确版本），所以 `lumakit-design` 没有带入 ThinkRail 的无头窗口测试；纯逻辑测试照常运行。
+
+## 后台日志
+
+设置 → 后台日志支持五级实时切换（保存到隔离数据目录的 `logs/level.json`）、TraceId/ME/模块搜索、EV/Layer 交集筛选、复制完整诊断 ID 与筛选结果。只在该页打开时读取最近 1000 行；INFO 下未记录的 DEBUG 历史不能补录。失败消息的复制按钮与聊天折叠诊断中的诊断 ID 可直接粘贴搜索。
+
+模型目录刷新、检测/同步、搜索检测/读取、MCP 配置保存均显式关联日志；MCP 页面目前不提供网络发现动作。成功/失败/取消/超时验证使用临时 `LUMADESK_DATA_DIR` 与本机回环服务，不发送真实密钥。任务和实测记录见 [LumaKit 日志任务](../../LumaKit/docs/Rust-LumaKit-日志-请求-响应-异常封装任务列表.md)。
 
 ## 已知问题
 

@@ -143,6 +143,18 @@ impl SearchSettings {
         if !self.status.is_empty() {
             body = body.child(label(text::METADATA, self.status.clone()).text_color(r.text_muted));
         }
+        if let Some(trace) = self.diagnostic_trace.clone() {
+            body = body.child(
+                Button::new("copy-search-request-diagnostic")
+                    .small()
+                    .link()
+                    .label("复制诊断 ID")
+                    .accessibility_label(format!("复制诊断 ID {trace}"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(trace.clone()))
+                    }),
+            );
+        }
         if busy {
             body = body.child(
                 Button::new("cancel-search-request")

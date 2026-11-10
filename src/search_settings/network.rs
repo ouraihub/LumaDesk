@@ -1,7 +1,9 @@
 //! Bounded search and page-reading execution.
 use super::*;
+use crate::settings_task::{self as task, Failure};
 use futures_util::StreamExt;
 use lumakit_ai::search::{self, SearchHit, SearchResult};
+use lumakit_observability::TraceContext;
 use reqwest::Url;
 mod policy;
 #[cfg(test)]
@@ -9,6 +11,36 @@ pub(super) use policy::normalize_rule;
 pub(super) use policy::{blocked, preferences_from_draft, validate_url};
 mod parsing;
 use parsing::*;
+mod page;
+pub(super) use page::html_text;
+use page::parse_page;
+async fn send(
+    request: reqwest::RequestBuilder,
+    cancel: &CancellationToken,
+    trace: &TraceContext,
+    deadline: tokio::time::Instant,
+    limit_ms: u64,
+) -> Result<(u16, String, String), Failure> {
+    task::http(
+        trace,
+        "settings.search.http",
+        cancel,
+        deadline,
+        limit_ms,
+        async {
+            let response = request
+                .send()
+                .await
+                .map_err(|e| Failure::request(e, 10_000, limit_ms))?;
+            let status = response.status().as_u16();
+            if !(200..=299).contains(&status) {
+                return Err(task::status(status));
+            }
+            read_limited(response, cancel, limit_ms).await
+        },
+    )
+    .await
+}
 #[cfg(test)]
 mod tests;
 
@@ -109,7 +141,8 @@ fn encoded(value: &str) -> String {
 async fn read_limited(
     response: reqwest::Response,
     cancel: &CancellationToken,
-) -> Result<(u16, String, String), String> {
+    limit_ms: u64,
+) -> Result<(u16, String, String), Failure> {
     let status = response.status().as_u16();
     let content_type = response
         .headers()
@@ -125,9 +158,9 @@ async fn read_limited(
     }
     let mut stream = response.bytes_stream();
     let mut bytes = Vec::new();
-    while let Some(chunk) = tokio::select! { _ = cancel.cancelled() => return Err("已取消".into()), c = stream.next() => c }
+    while let Some(chunk) = tokio::select! { _ = cancel.cancelled() => return Err(Failure::Cancelled), c = stream.next() => c }
     {
-        let chunk = chunk.map_err(|_| "响应读取失败".to_owned())?;
+        let chunk = chunk.map_err(|e| Failure::request(e, 10_000, limit_ms))?;
         if bytes.len() + chunk.len() > MAX_BODY {
             return Err("响应超过 2 MiB".into());
         }
@@ -153,25 +186,34 @@ pub(super) async fn search_query(
     query: String,
     preferences: SearchPreferences,
     cancel: CancellationToken,
-) -> Result<SearchResult, String> {
+    trace: &TraceContext,
+) -> Result<SearchResult, Failure> {
+    let deadline = task::deadline(15_000);
     if config.provider.is_fetch() {
         return Err("此服务商不提供搜索".into());
     }
     if config.provider.requires_key() && config.keys.is_empty() {
-        return Err("请先填写并保存搜索密钥".into());
+        return Err(Failure::failed(
+            "SETTINGS_KEY_NOT_SAVED",
+            "请先填写并保存搜索密钥",
+        ));
     }
-    let endpoint = endpoint_for(&config, true)?;
+    let endpoint = endpoint_for(&config, true)
+        .map_err(|message| Failure::failed("SETTINGS_INVALID_ENDPOINT", message))?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(15))
         .build()
-        .map_err(|_| "无法创建搜索客户端".to_owned())?;
+        .map_err(|_| Failure::failed("SETTINGS_CLIENT_FAILED", "无法创建搜索客户端"))?;
     let max = preferences.max_results.clamp(1, 50);
     let count = max.min(20).to_string();
     let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
-        let secret = nth_key(&config, index).map(SavedKey::open).transpose()?;
+        let secret = nth_key(&config, index)
+            .map(SavedKey::open)
+            .transpose()
+            .map_err(|message| Failure::failed("SETTINGS_SECRET_FAILED", message))?;
         let key = secret.as_ref().map(|value| value.as_str());
         let mut target = endpoint.clone();
         if config.provider == Provider::JinaSearch
@@ -193,14 +235,19 @@ pub(super) async fn search_query(
             Provider::Firecrawl => auth(client.post(target).json(&serde_json::json!({"query": query, "limit": max, "scrapeOptions": {"formats": ["markdown"]}})), &config, key),
             Provider::Direct | Provider::Jina | Provider::QueritFetch | Provider::FirecrawlFetch => return Err("此服务商不提供搜索".into()),
         };
-        let response = tokio::select! { _ = cancel.cancelled() => return Err("已取消".into()), result = request.send() => result.map_err(|_| "搜索请求失败或超时".to_owned())? };
-        let (status, _content_type, body) = read_limited(response, &cancel).await?;
-        if !matches!(status, 200..=299) {
-            if matches!(status, 401 | 403 | 429) && index + 1 < attempts {
+        let response = send(request, &cancel, trace, deadline, 15_000).await;
+        let (_, _content_type, body) = match response {
+            Ok(value) => value,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "SETTINGS_HTTP_UNAUTHORIZED" | "SETTINGS_HTTP_RATE_LIMITED"
+                ) && index + 1 < attempts =>
+            {
                 continue;
             }
-            return Err(format!("搜索失败（HTTP {status}）；未跟随重定向"));
-        }
+            Err(error) => return Err(error),
+        };
         if config.provider == Provider::ExaMcp {
             let hits = parse_mcp(&body)?;
             return Ok(process_hits(query, config.provider, hits, &preferences));
@@ -220,66 +267,48 @@ pub(super) async fn search_query(
     Err("没有可用搜索密钥".into())
 }
 
-fn parse_page(provider: Provider, value: &serde_json::Value, target: &str) -> Result<Page, String> {
-    let data = if provider == Provider::QueritFetch {
-        value
-            .pointer("/results")
-            .and_then(|v| v.as_array())
-            .and_then(|a| a.first())
-            .or_else(|| {
-                value
-                    .pointer("/data")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.first())
-            })
-            .unwrap_or(value)
-    } else {
-        value.get("data").unwrap_or(value)
-    };
-    let metadata = data.get("metadata").unwrap_or(data);
-    let title = text_field(metadata, &["title"]).if_empty_then(&text_field(data, &["title"]));
-    let body = text_field(data, &["markdown", "content", "text"]);
-    if body.trim().is_empty() {
-        return Err("网页响应缺少正文".into());
-    }
-    let url = text_field(metadata, &["sourceURL", "sourceUrl", "url", "link"])
-        .if_empty_then(&text_field(data, &["url", "link"]))
-        .if_empty_then(target);
-    Ok(Page {
-        title: title.if_empty_then(&url),
-        url,
-        body,
-    })
-}
-
 pub(super) async fn fetch_page(
     config: Config,
     target: String,
     prefs: SearchPreferences,
     cancel: CancellationToken,
-) -> Result<Page, String> {
-    let url = validate_url(&target)?;
+    trace: &TraceContext,
+) -> Result<Page, Failure> {
+    let deadline = task::deadline(20_000);
+    let url = validate_url(&target)
+        .map_err(|message| Failure::failed("SETTINGS_INVALID_ENDPOINT", message))?;
     if blocked(&url, &prefs.blacklist) {
-        return Err("目标地址命中黑名单，未发起请求".into());
+        return Err(Failure::failed(
+            "SETTINGS_TARGET_BLOCKED",
+            "目标地址命中黑名单，未发起请求",
+        ));
     }
     if config.provider == Provider::Direct && !config.keys.is_empty() {
         return Err("直接获取不发送 API 密钥".into());
     }
     if config.provider.requires_key() && config.keys.is_empty() {
-        return Err("请先填写并保存读取密钥".into());
+        return Err(Failure::failed(
+            "SETTINGS_KEY_NOT_SAVED",
+            "请先填写并保存读取密钥",
+        ));
     }
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(20))
         .build()
-        .map_err(|_| "无法创建读取客户端".to_owned())?;
+        .map_err(|_| Failure::failed("SETTINGS_CLIENT_FAILED", "无法创建读取客户端"))?;
     if config.provider == Provider::Direct {
-        let response = tokio::select! { _ = cancel.cancelled() => return Err("已取消".into()), result = client.get(url.clone()).header(reqwest::header::ACCEPT, "text/plain, text/html;q=0.8").send() => result.map_err(|_| "读取请求失败或超时".to_owned())? };
-        let (status, content_type, body) = read_limited(response, &cancel).await?;
-        if !(200..=299).contains(&status) {
-            return Err(format!("读取失败（HTTP {status}）；未跟随重定向"));
-        }
+        let (_, content_type, body) = send(
+            client
+                .get(url.clone())
+                .header(reqwest::header::ACCEPT, "text/plain, text/html;q=0.8"),
+            &cancel,
+            trace,
+            deadline,
+            20_000,
+        )
+        .await?;
         if !content_type.starts_with("text/")
             && !content_type.contains("xhtml")
             && !body.trim_start().starts_with('<')
@@ -297,10 +326,14 @@ pub(super) async fn fetch_page(
             body: body.chars().take(prefs.cutoff).collect(),
         });
     }
-    let endpoint = endpoint_for(&config, false)?;
+    let endpoint = endpoint_for(&config, false)
+        .map_err(|message| Failure::failed("SETTINGS_INVALID_ENDPOINT", message))?;
     let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
-        let secret = nth_key(&config, index).map(SavedKey::open).transpose()?;
+        let secret = nth_key(&config, index)
+            .map(SavedKey::open)
+            .transpose()
+            .map_err(|message| Failure::failed("SETTINGS_SECRET_FAILED", message))?;
         let key = secret.as_ref().map(|value| value.as_str());
         let request = match config.provider {
             Provider::Jina => auth(
@@ -333,14 +366,19 @@ pub(super) async fn fetch_page(
             ),
             _ => return Err("此服务商不提供读取".into()),
         };
-        let response = tokio::select! { _ = cancel.cancelled() => return Err("已取消".into()), result = request.send() => result.map_err(|_| "读取请求失败或超时".to_owned())? };
-        let (status, content_type, body) = read_limited(response, &cancel).await?;
-        if !matches!(status, 200..=299) {
-            if matches!(status, 401 | 403 | 429) && index + 1 < attempts {
+        let response = send(request, &cancel, trace, deadline, 20_000).await;
+        let (_, content_type, body) = match response {
+            Ok(value) => value,
+            Err(error)
+                if matches!(
+                    error.code(),
+                    "SETTINGS_HTTP_UNAUTHORIZED" | "SETTINGS_HTTP_RATE_LIMITED"
+                ) && index + 1 < attempts =>
+            {
                 continue;
             }
-            return Err(format!("读取失败（HTTP {status}）；未跟随重定向"));
-        }
+            Err(error) => return Err(error),
+        };
         if config.provider == Provider::Jina {
             let title = body
                 .lines()
@@ -366,87 +404,4 @@ pub(super) async fn fetch_page(
         return Ok(page);
     }
     Err("没有可用读取密钥".into())
-}
-
-pub(super) fn html_text(raw: &str) -> (String, String) {
-    let lower = raw.to_ascii_lowercase();
-    let title = lower
-        .find("<title>")
-        .and_then(|a| {
-            lower[a + 7..]
-                .find("</title>")
-                .map(|b| decode_entities(&raw[a + 7..a + 7 + b]))
-        })
-        .unwrap_or_default();
-    let mut out = String::new();
-    let mut pos = 0;
-    while pos < raw.len() {
-        if raw.as_bytes()[pos] == b'<' {
-            let Some(end) = raw[pos..].find('>') else {
-                break;
-            };
-            let end = pos + end;
-            let tag = lower[pos + 1..end].trim();
-            let skip = ["script", "style", "noscript", "template"]
-                .into_iter()
-                .find(|name| tag == *name || tag.split_whitespace().next() == Some(*name));
-            if let Some(name) = skip {
-                if let Some(close) = lower[end + 1..].find(&format!("</{name}")) {
-                    let close = end + 1 + close;
-                    if let Some(close_end) = lower[close..].find('>') {
-                        pos = close + close_end + 1;
-                        continue;
-                    }
-                }
-                break;
-            }
-            out.push(' ');
-            pos = end + 1;
-        } else {
-            let ch = raw[pos..].chars().next().unwrap_or(' ');
-            out.push(ch);
-            pos += ch.len_utf8();
-        }
-    }
-    (
-        title,
-        decode_entities(&out)
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" "),
-    )
-}
-
-fn decode_entities(raw: &str) -> String {
-    let mut out = String::with_capacity(raw.len());
-    let mut rest = raw;
-    while let Some(pos) = rest.find('&') {
-        out.push_str(&rest[..pos]);
-        rest = &rest[pos..];
-        if let Some(end) = rest.find(';').filter(|n| *n <= 12) {
-            let entity = &rest[1..end];
-            let c = match entity {
-                "amp" => Some('&'),
-                "lt" => Some('<'),
-                "gt" => Some('>'),
-                "quot" => Some('"'),
-                "apos" | "#39" => Some('\''),
-                "nbsp" => Some(' '),
-                _ => entity
-                    .strip_prefix("#x")
-                    .and_then(|s| u32::from_str_radix(s, 16).ok())
-                    .or_else(|| entity.strip_prefix('#').and_then(|s| s.parse().ok()))
-                    .and_then(char::from_u32),
-            };
-            if let Some(c) = c {
-                out.push(c);
-                rest = &rest[end + 1..];
-                continue;
-            }
-        }
-        out.push('&');
-        rest = &rest[1..];
-    }
-    out.push_str(rest);
-    out
 }

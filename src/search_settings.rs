@@ -22,6 +22,7 @@ mod stored;
 #[cfg(test)]
 mod tests;
 mod view;
+mod worker;
 use catalog::{PROVIDERS, Provider};
 use network::*;
 
@@ -97,9 +98,11 @@ enum Output {
 struct Job {
     cancel: CancellationToken,
     thread: thread::JoinHandle<()>,
-    receiver: mpsc::Receiver<Result<Output, String>>,
+    receiver: mpsc::Receiver<Result<Output, crate::settings_task::Failure>>,
     discard: bool,
     check: Option<usize>,
+    trace: lumakit_observability::TraceContext,
+    root: lumakit_observability::OperationGuard,
 }
 enum KeyAction {
     Add,
@@ -136,6 +139,8 @@ pub struct SearchSettings {
     result: Option<SearchResult>,
     page: Option<Page>,
     status: String,
+    diagnostic_trace: Option<String>,
+    card_diagnostic_trace: Vec<Option<String>>,
     job: Option<Job>,
     inputs: Option<SearchInputs>,
     advanced: bool,
@@ -216,6 +221,8 @@ impl SearchSettings {
             page: None,
             status: String::new(),
             job: None,
+            diagnostic_trace: None,
+            card_diagnostic_trace: vec![None; count],
             inputs: None,
             advanced: false,
             delete_key: None,
@@ -279,143 +286,42 @@ impl SearchSettings {
             self.query = inputs.query.read(cx).value().to_string();
             self.target = inputs.target.read(cx).value().to_string();
         }
-        self.launch(fetch, None);
+        self.launch(fetch, None, None);
         let _ = window;
         cx.notify();
     }
     fn check_provider(&mut self, index: usize, cx: &mut Context<Self>) {
-        if self.is_busy() || !self.submit_card(index, cx) {
-            return;
-        }
-        self.launch(self.stored.configs[index].provider.is_fetch(), Some(index));
-        cx.notify();
-    }
-    fn launch(&mut self, fetch: bool, check: Option<usize>) {
         if self.is_busy() {
             return;
         }
-        let index = check.unwrap_or(if fetch {
-            self.fetch_index
-        } else {
-            self.search_index
-        });
-        let input = if check.is_some() {
-            if fetch {
-                "https://example.com".to_owned()
-            } else {
-                "web search".to_owned()
-            }
-        } else if fetch {
-            self.target.trim().to_owned()
-        } else {
-            self.query.trim().to_owned()
-        };
-        if input.is_empty() || input.chars().count() > 4096 {
-            self.status = "请输入 1–4096 字符的搜索词或 URL".into();
-            return;
-        }
-        let config = self.stored.configs[index].clone();
-        let mut prefs = self.stored.preferences.clone();
-        if self.stored.compression == Compression::None {
-            prefs.cutoff = usize::MAX;
-        }
-        if check.is_some() {
-            self.card_status[index] = "正在检测…".into();
-            self.card_error[index] = false;
-        } else {
-            self.status = if fetch {
-                "正在读取…"
-            } else {
-                "正在搜索…"
-            }
-            .into();
-            if fetch {
-                self.page = None;
-            } else {
-                self.result = None;
-            }
-        }
-        let cancel = CancellationToken::new();
-        let worker_cancel = cancel.clone();
-        let (sender, receiver) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            let outcome = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| "无法创建网络运行时".to_owned())
-                .and_then(|rt| {
-                    rt.block_on(async move {
-                        let operation = async {
-                            if fetch {
-                                fetch_page(config, input, prefs, worker_cancel)
-                                    .await
-                                    .map(Output::Fetch)
-                            } else {
-                                search_query(config, input, prefs, worker_cancel)
-                                    .await
-                                    .map(Output::Search)
-                            }
-                        };
-                        tokio::time::timeout(
-                            Duration::from_secs(if fetch { 20 } else { 15 }),
-                            operation,
-                        )
-                        .await
-                        .map_err(|_| "请求达到总超时，已停止".to_owned())?
-                    })
-                });
-            let _ = sender.send(outcome);
-        });
-        self.job = Some(Job {
-            cancel,
-            thread: worker,
-            receiver,
-            discard: false,
-            check,
-        });
-    }
-    fn drain(&mut self) {
-        if !self
-            .job
-            .as_ref()
-            .is_some_and(|job| job.thread.is_finished())
-        {
-            return;
-        }
-        if let Some(job) = self.job.take() {
-            let result = job.receiver.try_recv();
-            let _ = job.thread.join();
-            if job.discard {
-                return;
-            }
-            if let Some(index) = job.check {
-                let checked = match result {
-                    Ok(Ok(Output::Search(result))) if !result.hits.is_empty() => {
-                        Ok(result.hits.len())
-                    }
-                    Ok(Ok(Output::Fetch(_))) => Ok(1),
-                    Ok(Ok(_)) => Err("检测未返回结果".into()),
-                    Ok(Err(error)) => Err(error),
-                    Err(_) => Err("网络工作线程异常结束".into()),
-                };
-                self.card_error[index] = checked.is_err();
-                self.card_status[index] =
-                    checked.map_or_else(|error| error, |count| format!("检测成功：{count} 条结果"));
-            } else {
-                match result {
-                    Ok(Ok(Output::Search(result))) => {
-                        self.status = format!("搜索完成：{} 条结果", result.hits.len());
-                        self.result = Some(result);
-                    }
-                    Ok(Ok(Output::Fetch(page))) => {
-                        self.status = "读取完成".into();
-                        self.page = Some(page);
-                    }
-                    Ok(Err(error)) => self.status = error,
-                    Err(_) => self.status = "网络工作线程异常结束".into(),
+        let (trace, root) =
+            lumakit_observability::TraceContext::root("settings.search.check", "ui");
+        let _entered = root.span().clone().entered();
+        let saved = crate::settings_task::sync(
+            &trace,
+            "settings.search.save",
+            "SETTINGS_STORE_WRITE_FAILED",
+            || {
+                if self.submit_card(index, cx) {
+                    Ok(())
+                } else {
+                    Err(self.card_status[index].clone())
                 }
-            }
+            },
+        );
+        if let Err(error) = saved {
+            self.card_status[index] = error.notice(&trace);
+            self.card_diagnostic_trace[index] = Some(trace.trace_id().to_owned());
+            crate::settings_task::end(root, &Err::<(), _>(error));
+            cx.notify();
+            return;
         }
+        self.launch(
+            self.stored.configs[index].provider.is_fetch(),
+            Some(index),
+            Some((trace, root)),
+        );
+        cx.notify();
     }
 }
 impl Drop for SearchSettings {
@@ -423,6 +329,7 @@ impl Drop for SearchSettings {
         self.cancel_and_clear();
         if let Some(job) = self.job.take() {
             let _ = job.thread.join();
+            job.root.cancel("settings_closed");
         }
     }
 }

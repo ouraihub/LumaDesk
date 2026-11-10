@@ -311,10 +311,10 @@ impl ModelSettings {
                             .rounded(radius::MD)
                             .bg(r.container_elevated_bg)
                             .on_click(cx.listener(move |this, _, _, cx| {
-                                if let Some(dialog) = &mut this.sync_dialog {
-                                    if !dialog.folded.remove(&name) {
-                                        dialog.folded.insert(name.clone());
-                                    }
+                                if let Some(dialog) = &mut this.sync_dialog
+                                    && !dialog.folded.remove(&name)
+                                {
+                                    dialog.folded.insert(name.clone());
                                 }
                                 cx.notify();
                             })),

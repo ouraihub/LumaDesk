@@ -79,13 +79,16 @@ fn every_search_provider_sends_its_protocol_and_returns_sources() {
             _ => json!({"results":[row]}),
         };
         let (endpoint, worker) = server(value.to_string(), "application/json");
-        let mut prefs = SearchPreferences::default();
-        prefs.max_results = 50;
+        let prefs = SearchPreferences {
+            max_results: 50,
+            ..Default::default()
+        };
         let result = run(search_query(
             config(provider, endpoint, true),
             "rust async".into(),
             prefs,
             CancellationToken::new(),
+            &crate::search_settings::tests::test_trace(),
         ))
         .unwrap();
         let request = worker.join().unwrap();
@@ -191,6 +194,7 @@ fn every_fetch_provider_sends_target_and_decodes_content() {
             target.clone(),
             SearchPreferences::default(),
             CancellationToken::new(),
+            &crate::search_settings::tests::test_trace(),
         ))
         .unwrap();
         let request = worker.join().unwrap();
@@ -241,6 +245,7 @@ fn mcp_sse_multiline_json_and_errors_remain_bounded_contracts() {
         "rust".into(),
         SearchPreferences::default(),
         CancellationToken::new(),
+        &crate::search_settings::tests::test_trace(),
     ))
     .unwrap();
     worker.join().unwrap();

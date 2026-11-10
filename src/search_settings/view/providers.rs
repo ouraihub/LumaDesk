@@ -181,6 +181,21 @@ impl SearchSettings {
                 },
             ),
         );
+        if let Some(trace) = self.card_diagnostic_trace[index]
+            .clone()
+            .filter(|_| self.card_error[index])
+        {
+            footer = footer.child(
+                Button::new(("copy-search-diagnostic", index))
+                    .small()
+                    .link()
+                    .label("复制诊断 ID")
+                    .accessibility_label(format!("复制诊断 ID {trace}"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(trace.clone()))
+                    }),
+            );
+        }
         if self
             .job
             .as_ref()

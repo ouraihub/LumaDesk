@@ -101,10 +101,9 @@ impl ModelEditor {
                             move |this, window, cx| {
                                 if let (Some(pricing), Some(next)) =
                                     (&mut this.value.settings.pricing, next)
+                                    && pricing.tiers.len() < 8
                                 {
-                                    if pricing.tiers.len() < 8 {
-                                        pricing.tiers.push(tier(next));
-                                    }
+                                    pricing.tiers.push(tier(next));
                                 }
                                 this.prepare_inputs(window, cx);
                             },

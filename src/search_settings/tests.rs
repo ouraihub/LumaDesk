@@ -48,8 +48,10 @@ fn sqlite_import_preserves_ciphertext_and_rolls_back_failed_save() {
 use std::io::{Read, Write};
 #[test]
 fn invalid_blacklist_is_atomic_and_url_path_is_case_sensitive() {
-    let mut original = SearchPreferences::default();
-    original.blacklist = vec!["kept.example".into()];
+    let original = SearchPreferences {
+        blacklist: vec!["kept.example".into()],
+        ..Default::default()
+    };
     assert!(preferences_from_draft(&original, "valid.example\nhttps://bad user/path").is_err());
     assert_eq!(original.blacklist, ["kept.example"]);
     let rules = vec![normalize_rule("https://EXAMPLE.COM/Private/*").unwrap()];
@@ -97,8 +99,10 @@ fn direct_fetch_uses_real_loopback_http_and_unicode_cutoff() {
         username: String::new(),
         selected_key: None,
     };
-    let mut prefs = SearchPreferences::default();
-    prefs.cutoff = 100;
+    let prefs = SearchPreferences {
+        cutoff: 100,
+        ..Default::default()
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -109,6 +113,7 @@ fn direct_fetch_uses_real_loopback_http_and_unicode_cutoff() {
             endpoint.clone(),
             prefs,
             CancellationToken::new(),
+            &test_trace(),
         ))
         .unwrap();
     assert_eq!(page.title, "本地网页");
@@ -167,6 +172,7 @@ fn search_http_and_encrypted_restart_readback() {
             "本地查询".into(),
             restored.preferences.clone(),
             CancellationToken::new(),
+            &test_trace(),
         ))
         .unwrap();
     assert_eq!(result.hits[0].title, "真实回环");
@@ -242,9 +248,11 @@ fn search_fails_over_only_auth_status_and_filters_before_result_limit() {
         keys,
         username: String::new(),
     };
-    let mut prefs = SearchPreferences::default();
-    prefs.max_results = 1;
-    prefs.blacklist = vec!["https://example.org/Private/*".into()];
+    let prefs = SearchPreferences {
+        max_results: 1,
+        blacklist: vec!["https://example.org/Private/*".into()],
+        ..Default::default()
+    };
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -255,6 +263,7 @@ fn search_fails_over_only_auth_status_and_filters_before_result_limit() {
             "实际查询".into(),
             prefs,
             CancellationToken::new(),
+            &test_trace(),
         ))
         .unwrap();
     assert_eq!(result.hits.len(), 1);
@@ -484,7 +493,7 @@ fn check_uses_saved_snapshot_and_does_not_replace_manual_results() {
         provider: "tavily".into(),
         hits: Vec::new(),
     });
-    settings.launch(false, Some(0));
+    settings.launch(false, Some(0), None);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while settings.is_busy() && std::time::Instant::now() < deadline {
         settings.poll();
@@ -563,5 +572,44 @@ fn preferred_key_survives_restart_delete_and_v1_database_upgrade() {
         .unwrap();
     drop(db);
     assert!(SearchSettings::load(&root).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+pub(super) fn test_trace() -> lumakit_observability::TraceContext {
+    let (trace, root) = lumakit_observability::TraceContext::root("test.search", "ui");
+    root.finish("REGISTERED");
+    trace
+}
+
+#[test]
+fn failed_read_exposes_same_diagnostic_for_status_and_copy_action() {
+    let root = std::env::temp_dir().join(format!(
+        "lumadesk-search-diagnostic-{}",
+        lumakit_support::secrets::new_id().unwrap()
+    ));
+    let mut settings = SearchSettings::load(&root).unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    settings.fetch_index = settings
+        .stored
+        .configs
+        .iter()
+        .position(|config| config.provider == Provider::Direct)
+        .unwrap();
+    settings.target = format!("http://{address}/private-query");
+    settings.launch(true, None, None);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while settings.is_busy() {
+        assert!(std::time::Instant::now() < deadline);
+        settings.poll();
+        thread::sleep(Duration::from_millis(5));
+    }
+    assert!(settings.page.is_none());
+    let diagnostic = settings.diagnostic_trace.as_deref().unwrap();
+    assert_eq!(diagnostic.len(), 32);
+    assert!(settings.status.contains(diagnostic));
+    assert!(!settings.status.contains("private-query"));
+    drop(settings);
     std::fs::remove_dir_all(root).unwrap();
 }

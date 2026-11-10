@@ -1,11 +1,15 @@
 //! Picker refresh reads saved state; discovery only adds models and never opens the sync editor.
 use super::*;
+use crate::settings_task::{self as task, Failure};
+use lumakit_observability::{OperationGuard, TraceContext};
 
-type Discovery = Vec<(DetectConfig, Result<Vec<String>, String>)>;
+type Discovery = Vec<(DetectConfig, Result<Vec<String>, Failure>)>;
 pub(super) struct CatalogRefreshJob {
     cancel: CancellationToken,
     thread: JoinHandle<()>,
     rx: mpsc::Receiver<Discovery>,
+    trace: TraceContext,
+    root: OperationGuard,
 }
 
 enum RefreshFailure {
@@ -36,16 +40,28 @@ impl RefreshFailure {
 impl ModelSettings {
     /// Reload saved configuration; force additionally discovers every enabled saved endpoint.
     pub fn refresh_catalog(&mut self, force: bool) {
-        if let Err(error) = self.reload_catalog() {
-            self.catalog_refresh_notice = RefreshFailure::Store(error).notice();
+        let (trace, root) = TraceContext::root("settings.catalog.refresh", "ui");
+        self.catalog_diagnostic_trace = None;
+        let _entered = root.span().clone().entered();
+        if let Err(error) = task::sync(
+            &trace,
+            "settings.catalog.load",
+            "SETTINGS_STORE_READ_FAILED",
+            || self.reload_catalog(),
+        ) {
+            self.catalog_refresh_notice = error.notice(&trace);
+            self.catalog_diagnostic_trace = Some(trace.trace_id().to_owned());
+            task::end(root, &Err::<(), _>(error));
             return;
         }
         if self.refreshing_catalog() {
+            root.finish("ALREADY_RUNNING");
             return;
         }
         if !force {
             self.catalog_refresh_notice =
                 format!("已重新载入本地目录：{} 个聊天模型", self.options.len());
+            root.finish("LOCAL_RELOADED");
             return;
         }
         let configs: Vec<_> = self
@@ -62,31 +78,57 @@ impl ModelSettings {
             .collect();
         if configs.is_empty() {
             self.catalog_refresh_notice = "没有已启用的已保存线路；未请求网络".into();
+            root.finish("NO_ENDPOINTS");
             return;
         }
         let count = configs.len();
         let cancel = CancellationToken::new();
         let worker_cancel = cancel.clone();
         let (tx, rx) = mpsc::channel();
+        let span = root.span().clone();
+        let worker_trace = trace.clone();
         let thread = std::thread::Builder::new()
             .name("model-catalog-refresh".into())
             .spawn(move || {
                 let mut results = Vec::with_capacity(configs.len());
+                let _entered = span.entered();
                 for config in configs {
                     if worker_cancel.is_cancelled() {
-                        return;
+                        break;
                     }
-                    let result = detect_models(&config.endpoint, worker_cancel.clone());
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        detect_models(&config.endpoint, worker_cancel.clone(), &worker_trace)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(Failure::failed(
+                            "SETTINGS_WORKER_FAILED",
+                            "模型刷新线程异常结束",
+                        ))
+                    });
                     results.push((config, result));
                 }
                 let _ = tx.send(results);
             });
         match thread {
             Ok(thread) => {
-                self.catalog_refresh = Some(CatalogRefreshJob { cancel, thread, rx });
+                self.catalog_refresh = Some(CatalogRefreshJob {
+                    cancel,
+                    thread,
+                    rx,
+                    trace,
+                    root,
+                });
                 self.catalog_refresh_notice = format!("正在刷新 {count} 条已保存线路的模型目录…");
             }
-            Err(_) => self.catalog_refresh_notice = RefreshFailure::Worker.notice(),
+            Err(_) => {
+                root.fail("SETTINGS_WORKER_START_FAILED");
+                self.catalog_diagnostic_trace = Some(trace.trace_id().to_owned());
+                self.catalog_refresh_notice = format!(
+                    "{}\n诊断 TraceId：{}",
+                    RefreshFailure::Worker.notice(),
+                    trace.trace_id()
+                );
+            }
         }
     }
 
@@ -97,6 +139,10 @@ impl ModelSettings {
     /// Local reload, network discovery, or typed failure notice for the picker.
     pub fn catalog_refresh_notice(&self) -> &str {
         &self.catalog_refresh_notice
+    }
+    /// Diagnostic identity of the latest failed refresh, for the picker copy action.
+    pub fn catalog_refresh_trace_id(&self) -> Option<&str> {
+        self.catalog_diagnostic_trace.as_deref()
     }
 
     fn reload_catalog(&mut self) -> Result<(), String> {
@@ -169,8 +215,10 @@ impl ModelSettings {
         let Some(job) = self.catalog_refresh.take() else {
             return false;
         };
+        let _entered = job.root.span().clone().entered();
         let joined = job.thread.join();
         if job.cancel.is_cancelled() {
+            job.root.cancel("user_cancelled");
             self.catalog_refresh_notice =
                 "[catalog_cancelled] 模型刷新已取消；原模型目录未修改".into();
             return true;
@@ -180,15 +228,51 @@ impl ModelSettings {
         } else {
             result
         };
-        self.catalog_refresh_notice = match result.and_then(|results| self.apply_discovery(results))
-        {
-            Ok(notice) => notice,
-            Err(error) => error.notice(),
+        let network_failure = result.as_ref().ok().and_then(|results| {
+            results
+                .iter()
+                .find_map(|(_, result)| result.as_ref().err().cloned())
+        });
+        let applied = task::sync(
+            &job.trace,
+            "settings.catalog.apply",
+            "SETTINGS_STORE_WRITE_FAILED",
+            || {
+                result
+                    .and_then(|results| self.apply_discovery(results))
+                    .map_err(RefreshFailure::notice)
+            },
+        );
+        let outcome = match &applied {
+            Err(error) => Err(error.clone()),
+            Ok((_, failed)) => network_failure.map_or_else(
+                || {
+                    if *failed {
+                        Err(Failure::failed(
+                            "SETTINGS_CATALOG_APPLY_FAILED",
+                            "部分线路未应用",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                },
+                Err,
+            ),
+        };
+        task::end(job.root, &outcome);
+        self.catalog_diagnostic_trace = outcome
+            .as_ref()
+            .err()
+            .map(|_| job.trace.trace_id().to_owned());
+        self.catalog_refresh_notice = match applied {
+            Ok((notice, _)) if outcome.is_ok() => notice,
+            Ok((notice, _)) => format!("{notice}\n诊断 TraceId：{}", job.trace.trace_id()),
+            Err(error) => error.notice(&job.trace),
         };
         true
     }
 
-    fn apply_discovery(&mut self, results: Discovery) -> Result<String, RefreshFailure> {
+    fn apply_discovery(&mut self, results: Discovery) -> Result<(String, bool), RefreshFailure> {
         // Re-read on the UI thread so edits committed while HTTP was running are not overwritten.
         let (providers, presets_initialized) = self.store.load().map_err(RefreshFailure::Store)?;
         let mut candidate = SettingsFile {
@@ -259,7 +343,7 @@ impl ModelSettings {
                     RefreshFailure::Endpoint {
                         provider: provider.name.clone(),
                         endpoint: endpoint.name.clone(),
-                        detail,
+                        detail: detail.to_string(),
                     }
                     .notice(),
                 ),
@@ -281,13 +365,14 @@ impl ModelSettings {
                 failures.join("\n")
             ));
         }
-        Ok(notice)
+        Ok((notice, !failures.is_empty()))
     }
 
     pub(super) fn cancel_catalog_refresh(&mut self) {
         if let Some(job) = self.catalog_refresh.take() {
             job.cancel.cancel();
             let _ = job.thread.join();
+            job.root.cancel("settings_closed");
         }
     }
 }

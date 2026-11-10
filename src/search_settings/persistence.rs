@@ -145,6 +145,7 @@ impl SearchSettings {
         self.submit_key(index, action, window, cx);
     }
     fn report(&mut self, index: usize, result: Result<(), String>, success: &str) -> bool {
+        self.card_diagnostic_trace[index] = None;
         self.card_error[index] = result.is_err();
         self.card_status[index] = result
             .as_ref()

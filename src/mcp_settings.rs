@@ -16,6 +16,8 @@ use lumakit_design::components::{IconButton, label};
 use lumakit_design::metrics::{size, space, text};
 use std::path::{Path, PathBuf};
 
+use crate::settings_task as task;
+use lumakit_observability::TraceContext;
 pub struct McpSettings {
     root: PathBuf,
     servers: Vec<McpServerConfig>,
@@ -23,6 +25,7 @@ pub struct McpSettings {
     enabled: bool,
     trusted: bool,
     status: String,
+    diagnostic_trace: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
 
@@ -32,7 +35,17 @@ impl McpSettings {
         window: &mut Window,
         cx: &mut gpui_kit::App,
     ) -> Result<Entity<Self>, String> {
-        let servers = crate::settings_store::load_mcp(root)?
+        let (trace, guard) = TraceContext::root("settings.mcp.load", "ui");
+        let _entered = guard.span().clone().entered();
+        let result = task::sync(
+            &trace,
+            "settings.mcp.store.load",
+            "SETTINGS_STORE_READ_FAILED",
+            || crate::settings_store::load_mcp(root),
+        );
+        task::end(guard, &result);
+        let servers = result
+            .map_err(|error| error.notice(&trace))?
             .map(|data| data.servers)
             .unwrap_or_default();
         Ok(cx.new(|cx| Self::with_servers(root, servers, window, cx)))
@@ -56,30 +69,44 @@ impl McpSettings {
             enabled: false,
             trusted: false,
             status: String::new(),
+            diagnostic_trace: None,
             _subscriptions: vec![subscription],
         }
     }
 
     fn save(&mut self, next: Vec<McpServerConfig>) -> bool {
-        match crate::settings_store::save_mcp(
-            &self.root,
-            &crate::settings_store::McpData {
-                servers: next.clone(),
+        let (trace, guard) = TraceContext::root("settings.mcp.save", "ui");
+        let _entered = guard.span().clone().entered();
+        let result = task::sync(
+            &trace,
+            "settings.mcp.store.save",
+            "SETTINGS_STORE_WRITE_FAILED",
+            || {
+                crate::settings_store::save_mcp(
+                    &self.root,
+                    &crate::settings_store::McpData {
+                        servers: next.clone(),
+                    },
+                )
             },
-        ) {
+        );
+        task::end(guard, &result);
+        self.diagnostic_trace = result.as_ref().err().map(|_| trace.trace_id().to_owned());
+        match result {
             Ok(()) => {
                 self.servers = next;
                 self.status = "已保存".into();
                 true
             }
             Err(error) => {
-                self.status = format!("保存失败：{error}；原配置保持不变，可重试");
+                self.status = format!("保存失败：{}；原配置保持不变，可重试", error.notice(&trace));
                 false
             }
         }
     }
 
     fn add(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.diagnostic_trace = None;
         let config = McpServerConfig {
             url: self.url.read(cx).value().trim().to_owned(),
             enabled: self.enabled,
@@ -235,6 +262,18 @@ impl Render for McpSettings {
             } else {
                 ui::notice(self.status.clone(), ui::Tone::Error, &r)
             });
+        }
+        if let Some(trace) = self.diagnostic_trace.clone() {
+            body = body.child(
+                Button::new("copy-mcp-diagnostic")
+                    .small()
+                    .link()
+                    .label("复制诊断 ID")
+                    .accessibility_label(format!("复制诊断 ID {trace}"))
+                    .on_click(move |_, _, cx| {
+                        cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(trace.clone()))
+                    }),
+            );
         }
         body
     }
