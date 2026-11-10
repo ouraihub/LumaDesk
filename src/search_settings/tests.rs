@@ -236,10 +236,14 @@ fn search_fails_over_only_auth_status_and_filters_before_result_limit() {
             }
         }
     });
-    // The preferred key is the second one: requests start there and wrap to the first.
+    // Enabled legacy preference starts second; a disabled corrupt entry is never decrypted.
+    let mut disabled = SavedKey::new("disabled-failover").unwrap();
+    disabled.enabled = false;
+    disabled.ciphertext = vec![0];
     let keys = vec![
         SavedKey::new("failover-second").unwrap(),
         SavedKey::new("failover-first").unwrap(),
+        disabled,
     ];
     let config = Config {
         provider: Provider::Tavily,
@@ -508,7 +512,7 @@ fn check_uses_saved_snapshot_and_does_not_replace_manual_results() {
 }
 
 #[test]
-fn preferred_key_survives_restart_delete_and_v1_database_upgrade() {
+fn legacy_preference_survives_restart_delete_and_v1_database_upgrade() {
     let root = std::env::temp_dir().join(format!(
         "lumadesk-search-preferred-{}",
         lumakit_support::new_id().unwrap()
@@ -523,19 +527,24 @@ fn preferred_key_survives_restart_delete_and_v1_database_upgrade() {
         .iter()
         .map(|key| key.id.clone())
         .collect();
-    // The first saved key becomes preferred; choosing another persists across restarts.
+    // Existing preferences remain readable, but enabling is the only credential state action.
     assert_eq!(
         settings.stored.configs[0].selected_key.as_ref(),
         Some(&ids[0])
     );
     assert!(
         settings
-            .save(0, Some(KeyAction::Select("missing".into())))
+            .save(0, Some(KeyAction::SetEnabled("missing".into(), false)))
             .is_err()
     );
-    settings
-        .save(0, Some(KeyAction::Select(ids[1].clone())))
-        .unwrap();
+    let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+    db.execute(
+        "UPDATE search_configs SET selected_key=?1 WHERE position=0",
+        [&ids[1]],
+    )
+    .unwrap();
+    drop(db);
+    settings = SearchSettings::load(&root).unwrap();
     let restored = SearchSettings::load(&root).unwrap();
     assert_eq!(
         restored.stored.configs[0].selected_key.as_ref(),
@@ -555,7 +564,7 @@ fn preferred_key_survives_restart_delete_and_v1_database_upgrade() {
     drop(settings);
     // A schema-1 database has no preference column: it upgrades with keys kept and none chosen.
     let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
-    db.execute_batch("ALTER TABLE search_configs DROP COLUMN selected_key; PRAGMA user_version=1;")
+    db.execute_batch("ALTER TABLE search_configs DROP COLUMN selected_key; ALTER TABLE search_keys DROP COLUMN label; ALTER TABLE search_keys DROP COLUMN enabled; PRAGMA user_version=1;")
         .unwrap();
     drop(db);
     let upgraded = SearchSettings::load(&root).unwrap();
@@ -610,6 +619,180 @@ fn failed_read_exposes_same_diagnostic_for_status_and_copy_action() {
     assert_eq!(diagnostic.len(), 32);
     assert!(settings.status.contains(diagnostic));
     assert!(!settings.status.contains("private-query"));
+    drop(settings);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn schema_two_credentials_gain_metadata_without_reencrypting() {
+    let root = std::env::temp_dir().join(format!(
+        "lumadesk-search-schema-two-{}",
+        lumakit_support::new_id().unwrap()
+    ));
+    let mut settings = SearchSettings::load(&root).unwrap();
+    settings.drafts[0].key = "old-schema-secret".into();
+    settings.save(0, Some(KeyAction::Add)).unwrap();
+    let key = settings.stored.configs[0].keys[0].clone();
+    drop(settings);
+    let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+    db.execute_batch("ALTER TABLE search_keys DROP COLUMN label; ALTER TABLE search_keys DROP COLUMN enabled; PRAGMA user_version=2;").unwrap();
+    drop(db);
+    let restored = SearchSettings::load(&root).unwrap();
+    let upgraded = &restored.stored.configs[0].keys[0];
+    assert_eq!(upgraded.id, key.id);
+    assert_eq!(upgraded.masked, key.masked);
+    assert_eq!(upgraded.ciphertext, key.ciphertext);
+    assert_eq!(upgraded.label, None);
+    assert!(upgraded.enabled);
+    assert_eq!(
+        restored.stored.configs[0].selected_key.as_ref(),
+        Some(&key.id)
+    );
+    drop(restored);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn label_edit_and_enable_are_independent_atomic_credential_mutations() {
+    let root = std::env::temp_dir().join(format!(
+        "lumadesk-search-metadata-{}",
+        lumakit_support::new_id().unwrap()
+    ));
+    let mut settings = SearchSettings::load(&root).unwrap();
+    settings.drafts[0].key = "metadata-secret".into();
+    settings.drafts[0].label = "  主账户  ".into();
+    settings.save(0, Some(KeyAction::Add)).unwrap();
+    let original = settings.stored.configs[0].keys[0].clone();
+    assert_eq!(original.label.as_deref(), Some("主账户"));
+    assert!(settings.drafts[0].label.is_empty());
+    assert!(settings.drafts[0].key.is_empty());
+    settings.drafts[0].label = "  工作账户  ".into();
+    settings
+        .save(
+            0,
+            Some(KeyAction::Replace(original.id.clone(), String::new())),
+        )
+        .unwrap();
+    let restored = SearchSettings::load(&root).unwrap();
+    let renamed = &restored.stored.configs[0].keys[0];
+    assert_eq!(renamed.label.as_deref(), Some("工作账户"));
+    assert_eq!(renamed.ciphertext, original.ciphertext);
+    assert_eq!(renamed.masked, original.masked);
+    assert!(renamed.enabled);
+    settings.drafts[0].endpoint = "unfinished endpoint".into();
+    settings.drafts[4].endpoint = "another unfinished endpoint".into();
+    settings.drafts[0].username = "unfinished-user".into();
+    settings.drafts[0].key = "pending-secret".into();
+    settings.drafts[0].label = "pending-label".into();
+    settings.drafts[0].editing = Some(original.id.clone());
+    settings.drafts[0].submitted = true;
+    settings.drafts[0].revealed = Some((original.id.clone(), "visible-secret".into()));
+    let generation = settings.drafts[0].generation;
+    settings
+        .save(0, Some(KeyAction::SetEnabled(original.id.clone(), false)))
+        .unwrap();
+    let disabled = SearchSettings::load(&root).unwrap();
+    assert!(!disabled.stored.configs[0].keys[0].enabled);
+    assert_eq!(
+        disabled.stored.configs[0].keys[0].label.as_deref(),
+        Some("工作账户")
+    );
+    assert_eq!(
+        disabled.stored.configs[0].keys[0].ciphertext,
+        original.ciphertext
+    );
+    assert_eq!(
+        disabled.stored.configs[0].endpoint,
+        Provider::Tavily.endpoint()
+    );
+    assert_eq!(
+        disabled.stored.configs[4].endpoint,
+        Provider::Jina.endpoint()
+    );
+    assert_eq!(settings.drafts[0].key, "pending-secret");
+    assert_eq!(settings.drafts[0].label, "pending-label");
+    assert_eq!(settings.drafts[0].username, "unfinished-user");
+    assert_eq!(settings.drafts[0].endpoint, "unfinished endpoint");
+    assert_eq!(settings.drafts[4].endpoint, "another unfinished endpoint");
+    assert_eq!(settings.drafts[0].editing.as_ref(), Some(&original.id));
+    assert_eq!(settings.drafts[0].generation, generation);
+    assert!(settings.drafts[0].submitted);
+    assert_eq!(
+        settings.drafts[0].revealed.as_ref().unwrap().1,
+        "visible-secret"
+    );
+    let db = rusqlite::Connection::open(root.join("settings.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER reject_metadata BEFORE INSERT ON search_keys BEGIN SELECT RAISE(ABORT,'injected failure'); END;").unwrap();
+    assert!(
+        settings
+            .save(0, Some(KeyAction::SetEnabled(original.id.clone(), true)))
+            .is_err()
+    );
+    assert!(!settings.stored.configs[0].keys[0].enabled);
+    assert!(!SearchSettings::load(&root).unwrap().stored.configs[0].keys[0].enabled);
+    assert_eq!(settings.drafts[0].key, "pending-secret");
+    assert_eq!(settings.drafts[0].label, "pending-label");
+    assert_eq!(settings.drafts[0].editing.as_ref(), Some(&original.id));
+    assert_eq!(settings.drafts[0].generation, generation);
+    assert!(settings.drafts[0].submitted);
+    settings.drafts[0].label = "failed rename".into();
+    assert!(
+        settings
+            .save(
+                0,
+                Some(KeyAction::Replace(original.id.clone(), String::new()))
+            )
+            .is_err()
+    );
+    assert_eq!(
+        settings.stored.configs[0].keys[0].label.as_deref(),
+        Some("工作账户")
+    );
+    assert_eq!(
+        settings.stored.configs[0].keys[0].ciphertext,
+        original.ciphertext
+    );
+    assert_eq!(settings.drafts[0].label, "failed rename");
+    assert_eq!(
+        SearchSettings::load(&root).unwrap().stored.configs[0].keys[0]
+            .label
+            .as_deref(),
+        Some("工作账户")
+    );
+    settings.drafts[0].label = "invalid\nlabel".into();
+    assert!(
+        settings
+            .save(
+                0,
+                Some(KeyAction::Replace(original.id.clone(), String::new()))
+            )
+            .is_err()
+    );
+    assert_eq!(
+        settings.stored.configs[0].keys[0].label.as_deref(),
+        Some("工作账户")
+    );
+    assert_eq!(settings.drafts[0].key, "pending-secret");
+    assert_eq!(settings.drafts[0].label, "invalid\nlabel");
+    db.execute_batch("DROP TRIGGER reject_metadata;").unwrap();
+    settings.drafts[0].label = String::new();
+    settings
+        .save(
+            0,
+            Some(KeyAction::Replace(original.id.clone(), String::new())),
+        )
+        .unwrap();
+    let unlabelled = SearchSettings::load(&root).unwrap();
+    assert_eq!(unlabelled.stored.configs[0].keys[0].label, None);
+    assert!(!unlabelled.stored.configs[0].keys[0].enabled);
+    assert_eq!(
+        unlabelled.stored.configs[0].keys[0].ciphertext,
+        original.ciphertext
+    );
+    drop(db);
+    drop(unlabelled);
+    drop(disabled);
+    drop(restored);
     drop(settings);
     std::fs::remove_dir_all(root).unwrap();
 }

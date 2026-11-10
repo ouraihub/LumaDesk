@@ -170,15 +170,40 @@ async fn read_limited(
     Ok((status, content_type, body))
 }
 
-/// The `attempt`-th key to try: the preferred key first, then the rest in list order, wrapping.
+/// Enabled legacy preference first, then enabled credentials in saved order, wrapping once.
 fn nth_key(config: &Config, attempt: usize) -> Option<&SavedKey> {
     let first = config
         .selected_key
         .as_ref()
-        .and_then(|id| config.keys.iter().position(|key| &key.id == id))
+        .and_then(|id| {
+            config
+                .keys
+                .iter()
+                .position(|key| &key.id == id && key.enabled)
+        })
         .unwrap_or(0);
-    let count = config.keys.len();
-    (count > 0).then(|| &config.keys[(first + attempt) % count])
+    config.keys[first..]
+        .iter()
+        .chain(&config.keys[..first])
+        .filter(|key| key.enabled)
+        .nth(attempt)
+}
+
+fn credential_attempts(config: &Config) -> Result<usize, Failure> {
+    let enabled = config.keys.iter().filter(|key| key.enabled).count();
+    if !config.keys.is_empty() && enabled == 0 {
+        return Err(Failure::failed(
+            "SETTINGS_NO_ENABLED_KEY",
+            "所有密钥均已停用；请先启用至少一个密钥",
+        ));
+    }
+    if config.provider.requires_key() && config.keys.is_empty() {
+        return Err(Failure::failed(
+            "SETTINGS_KEY_NOT_SAVED",
+            "请先填写并保存此服务商的密钥",
+        ));
+    }
+    Ok(enabled.clamp(1, 16))
 }
 
 pub(super) async fn search_query(
@@ -192,12 +217,7 @@ pub(super) async fn search_query(
     if config.provider.is_fetch() {
         return Err("此服务商不提供搜索".into());
     }
-    if config.provider.requires_key() && config.keys.is_empty() {
-        return Err(Failure::failed(
-            "SETTINGS_KEY_NOT_SAVED",
-            "请先填写并保存搜索密钥",
-        ));
-    }
+    let attempts = credential_attempts(&config)?;
     let endpoint = endpoint_for(&config, true)
         .map_err(|message| Failure::failed("SETTINGS_INVALID_ENDPOINT", message))?;
     let client = reqwest::Client::builder()
@@ -208,7 +228,6 @@ pub(super) async fn search_query(
         .map_err(|_| Failure::failed("SETTINGS_CLIENT_FAILED", "无法创建搜索客户端"))?;
     let max = preferences.max_results.clamp(1, 50);
     let count = max.min(20).to_string();
-    let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
         let secret = nth_key(&config, index)
             .map(SavedKey::open)
@@ -286,12 +305,7 @@ pub(super) async fn fetch_page(
     if config.provider == Provider::Direct && !config.keys.is_empty() {
         return Err("直接获取不发送 API 密钥".into());
     }
-    if config.provider.requires_key() && config.keys.is_empty() {
-        return Err(Failure::failed(
-            "SETTINGS_KEY_NOT_SAVED",
-            "请先填写并保存读取密钥",
-        ));
-    }
+    let attempts = credential_attempts(&config)?;
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10))
@@ -328,7 +342,6 @@ pub(super) async fn fetch_page(
     }
     let endpoint = endpoint_for(&config, false)
         .map_err(|message| Failure::failed("SETTINGS_INVALID_ENDPOINT", message))?;
-    let attempts = config.keys.len().clamp(1, 16);
     for index in 0..attempts {
         let secret = nth_key(&config, index)
             .map(SavedKey::open)

@@ -91,7 +91,15 @@ impl SearchSettings {
                             .child(website),
                     ),
             )
-            .child(select);
+            .child(
+                div()
+                    .capture_any_mouse_down(cx.listener(move |this, _, _, _| {
+                        this.drafts[index].generation =
+                            this.drafts[index].generation.wrapping_add(1);
+                        this.drafts[index].submitted = true;
+                    }))
+                    .child(select),
+            );
         let mut fields = v_flex()
             .min_w_0()
             .gap(space::S12)
@@ -172,18 +180,20 @@ impl SearchSettings {
                     })),
             );
         }
-        footer = footer.child(
-            label(text::METADATA, self.card_status[index].clone()).text_color(
-                if self.card_error[index] {
-                    r.feedback_error
-                } else {
-                    r.text_muted
-                },
-            ),
-        );
+        if self.key_dialog != Some(index) {
+            footer = footer.child(
+                label(text::METADATA, self.card_status[index].clone()).text_color(
+                    if self.card_error[index] {
+                        r.feedback_error
+                    } else {
+                        r.text_muted
+                    },
+                ),
+            );
+        }
         if let Some(trace) = self.card_diagnostic_trace[index]
             .clone()
-            .filter(|_| self.card_error[index])
+            .filter(|_| self.card_error[index] && self.key_dialog != Some(index))
         {
             footer = footer.child(
                 Button::new(("copy-search-diagnostic", index))

@@ -1,6 +1,62 @@
 //! Provider, endpoint and credential draft editing.
 use super::*;
 impl ModelSettings {
+    pub(super) fn set_key_enabled(&mut self, p: usize, e: usize, id: &str, enabled: bool) {
+        if self.job.is_some() {
+            return;
+        }
+        let Some(index) = self.draft.providers[p].endpoints[e]
+            .keys
+            .iter()
+            .position(|key| key.id == id)
+        else {
+            self.report(Err("密钥已不存在".into()), "");
+            return;
+        };
+        let before = self.draft.providers[p].endpoints[e].keys[index].enabled;
+        self.draft.providers[p].endpoints[e].keys[index].enabled = enabled;
+        let result = self.persist_keys(p, e);
+        if !self.report(result, "密钥启用状态已保存") {
+            self.draft.providers[p].endpoints[e].keys[index].enabled = before;
+        }
+    }
+    pub(super) fn key_target(&self) -> Option<(usize, usize)> {
+        if let Some(EditorDialog::Keys { provider, endpoint }) = &self.editor {
+            let p = self
+                .draft
+                .providers
+                .iter()
+                .position(|p| &p.id == provider)?;
+            let e = self.draft.providers[p]
+                .endpoints
+                .iter()
+                .position(|e| &e.id == endpoint)?;
+            Some((p, e))
+        } else if self.editor.is_none() {
+            self.indices().and_then(|(p, e)| e.map(|e| (p, e)))
+        } else {
+            None
+        }
+    }
+
+    pub(super) fn submit_key(&mut self) -> bool {
+        if self.job.is_some() {
+            return false;
+        }
+        let Some((p, e)) = self.key_target() else {
+            return false;
+        };
+        let id = self.draft.providers[p].endpoints[e].id.clone();
+        let Some(draft) = self.key_drafts.get_mut(&id) else {
+            return false;
+        };
+        if draft.value.trim().is_empty() && draft.editing.is_none() {
+            return false;
+        }
+        draft.submitted = true;
+        self.save_key(p, e);
+        !self.error
+    }
     pub(super) fn open_endpoint(&mut self, p: usize, e: Option<usize>) {
         let endpoint = e.map(|e| &self.draft.providers[p].endpoints[e]);
         self.editor = Some(EditorDialog::Endpoint {
@@ -41,22 +97,36 @@ impl ModelSettings {
         let draft = self.key_drafts.entry(endpoint_id.clone()).or_default();
         let value = Zeroizing::new(draft.value.trim().to_owned());
         let editing = draft.editing.clone();
+        let label = match normalize_key_label(&draft.label) {
+            Ok(label) => label.map(str::to_owned),
+            Err(error) => {
+                self.report(Err(error), "");
+                return;
+            }
+        };
         let original_keys = self.draft.providers[p].endpoints[e].keys.clone();
         let original_selection = self.draft.providers[p].endpoints[e].selected_key.clone();
         let endpoint = &mut self.draft.providers[p].endpoints[e];
-        let result = if value.is_empty() {
-            Err("密钥不能为空，原凭据未修改".into())
-        } else if let Some(id) = editing {
+        let result = if let Some(id) = editing {
             endpoint
                 .keys
                 .iter_mut()
                 .find(|key| key.id == id)
                 .ok_or_else(|| "待修改密钥已不存在".to_owned())
-                .and_then(|key| key.replace(&value))
+                .and_then(|key| {
+                    if !value.is_empty() {
+                        key.replace(&value)?;
+                    }
+                    key.label = label;
+                    Ok(())
+                })
+        } else if value.is_empty() {
+            Err("密钥不能为空，原凭据未修改".into())
         } else if endpoint.keys.len() >= MAX_KEYS {
             Err("每条线路最多保存 16 个密钥".into())
         } else {
-            SavedKey::new(&value).map(|key| {
+            SavedKey::new(&value).map(|mut key| {
+                key.label = label;
                 if endpoint.selected_key.is_none() {
                     endpoint.selected_key = Some(key.id.clone());
                 }
@@ -69,6 +139,7 @@ impl ModelSettings {
                 if self.report(result, "密钥已加密保存") {
                     let draft = self.key_drafts.get_mut(&endpoint_id).unwrap();
                     draft.value.zeroize();
+                    draft.label.clear();
                     draft.editing = None;
                     draft.revealed = None;
                     draft.revealed_key = None;

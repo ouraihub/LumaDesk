@@ -15,7 +15,6 @@ use lumakit_design::{
 };
 
 const PROVIDER_WIDTH: gpui_kit::Pixels = px(136.);
-const DIALOG_WIDTH: gpui_kit::Pixels = px(560.);
 const BLACKLIST_HEIGHT: gpui_kit::Pixels = px(96.);
 const RESULT_HEIGHT: gpui_kit::Pixels = px(320.);
 fn card() -> gpui_kit::Div {
@@ -30,6 +29,7 @@ fn field(name: &'static str, input: impl IntoElement, cx: &gpui_kit::App) -> gpu
     ui::field(name, input, &lumakit_design::LumaTheme::global(cx).roles)
 }
 mod advanced;
+mod key_dialog;
 mod keys;
 mod providers;
 

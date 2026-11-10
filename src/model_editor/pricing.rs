@@ -7,7 +7,8 @@ use lumakit_design::{LumaTheme, metrics::radius};
 impl ModelEditor {
     pub(super) fn pricing_card(&self, cx: &Context<Self>) -> gpui_kit::Div {
         let r = LumaTheme::global(cx).roles;
-        let mut card = super::view::card(&r).child(group_label("价格 · 每百万 Token"));
+        let mut card = lumakit_gpui::providers::form_fields(std::iter::empty())
+            .child(group_label("价格 · 每百万 Token"));
         if let Some(pricing) = &self.value.settings.pricing {
             card = card.child(
                 label(styles::METADATA, "已设置自定义价格；清除后恢复来源参考。")
@@ -54,6 +55,7 @@ impl ModelEditor {
                         &format!("pricing.{index}.{field}"),
                         &format!("第 {} 档 · {name}", index + 1),
                         index == 0 && field == "start",
+                        cx,
                     ));
                 }
                 row = row.child(

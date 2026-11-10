@@ -18,7 +18,10 @@ use lumakit_ai::{
     catalog::ModelEntry,
     model_config::{ModelType, PriceTier},
 };
+mod inputs;
 mod pricing;
+#[cfg(test)]
+mod tests;
 mod view;
 
 #[derive(Default)]
@@ -173,173 +176,16 @@ impl ModelEditor {
         )
         .validate(self.protocol)
     }
-    fn prepare_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut values = vec![
-            ("id".into(), self.value.id.clone()),
-            (
-                "name".into(),
-                self.value.settings.name.clone().unwrap_or_default(),
-            ),
-            (
-                "group".into(),
-                self.value.settings.group_name.clone().unwrap_or_default(),
-            ),
-            ("context".into(), text(self.value.settings.context_window)),
-            ("input".into(), text(self.value.settings.max_input)),
-            ("output".into(), text(self.value.settings.max_output)),
-        ];
-        if let Some(pricing) = &self.value.settings.pricing {
-            for (index, price) in pricing.tiers.iter().enumerate() {
-                for (field, value) in [
-                    ("start", price.min_input_tokens.to_string()),
-                    ("input", price.input.to_string()),
-                    ("output", price.output.to_string()),
-                    ("read", text(price.cache_read)),
-                    ("write", text(price.cache_write)),
-                ] {
-                    values.push((format!("pricing.{index}.{field}"), value));
-                }
-            }
-        }
-        self.inputs
-            .retain(|key, _| values.iter().any(|(name, _)| name == key));
-        for (key, initial) in values {
-            if self.inputs.contains_key(&key) {
-                continue;
-            }
-            let initial = self
-                .state
-                .text
-                .entry(key.clone())
-                .or_insert(initial)
-                .clone();
-            let placeholder = match key.as_str() {
-                "name" => "留空使用模型 ID",
-                "group" => "留空自动分组",
-                "context" => "自动使用来源参考或默认容量",
-                "input" => "留空不单独限制输入",
-                "output" => "留空使用默认输出预算",
-                _ => "",
-            };
-            let input = cx.new(|cx| {
-                InputState::new(window, cx)
-                    .default_value(initial)
-                    .placeholder(placeholder)
-            });
-            let name = key.clone();
-            let subscription = cx.subscribe(&input, move |this, input, event: &InputEvent, cx| {
-                if matches!(event, InputEvent::Change) {
-                    let value = input.read(cx).value().to_string();
-                    this.apply_text(&name, value);
-                    cx.notify();
-                }
-            });
-            self.inputs.insert(key, (input, subscription));
-        }
-    }
-    fn reset(&mut self, prefix: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.state.clear(prefix);
-        self.inputs.retain(|key, _| !key.starts_with(prefix));
-        self.prepare_inputs(window, cx);
-    }
-    fn apply_text(&mut self, key: &str, value: String) {
-        self.state.text.insert(key.into(), value.clone());
-        self.state.errors.remove(key);
-        let result = match key {
-            "id" => {
-                if !self.existing {
-                    self.value.id = value;
-                }
-                Ok(())
-            }
-            "name" => {
-                self.value.settings.name = (!value.trim().is_empty()).then_some(value);
-                Ok(())
-            }
-            "group" => {
-                self.value.settings.group_name = (!value.trim().is_empty()).then_some(value);
-                Ok(())
-            }
-            "context" => parse(
-                &value,
-                &mut self.value.settings.context_window,
-                false,
-                |v| v > 0,
-            ),
-            "input" => parse(&value, &mut self.value.settings.max_input, false, |v| v > 0),
-            "output" => parse(&value, &mut self.value.settings.max_output, false, |v| {
-                v > 0
-            }),
-            _ => {
-                let result = key
-                    .strip_prefix("pricing.")
-                    .and_then(|s| s.split_once('.'))
-                    .and_then(|(index, field)| {
-                        index.parse::<usize>().ok().map(|index| (index, field))
-                    });
-                if let Some((index, field)) = result {
-                    if let Some(price) = self
-                        .value
-                        .settings
-                        .pricing
-                        .as_mut()
-                        .and_then(|p| p.tiers.get_mut(index))
-                    {
-                        match field {
-                            "start" => {
-                                let mut target = Some(price.min_input_tokens);
-                                let result = parse(&value, &mut target, true, |_| true);
-                                if let Some(v) = target {
-                                    price.min_input_tokens = v;
-                                }
-                                result
-                            }
-                            "input" | "output" => {
-                                let target = if field == "input" {
-                                    &mut price.input
-                                } else {
-                                    &mut price.output
-                                };
-                                let mut amount = Some(*target);
-                                let result = parse(&value, &mut amount, true, valid_price);
-                                if let Some(v) = amount {
-                                    *target = v;
-                                }
-                                result
-                            }
-                            "read" => parse(&value, &mut price.cache_read, false, valid_price),
-                            "write" => parse(&value, &mut price.cache_write, false, valid_price),
-                            _ => Ok(()),
-                        }
-                    } else {
-                        Ok(())
-                    }
-                } else {
-                    Ok(())
-                }
-            }
-        };
-        if result.is_err() {
-            self.state.errors.insert(
-                key.into(),
-                format!("{key}：请输入有效数字（预算/容量为正整数，价格为 0–1000000）"),
-            );
-        }
-    }
-    fn field(&self, key: &str, name: &str, readonly: bool) -> gpui_kit::Div {
-        div()
-            .flex()
-            .flex_col()
-            .min_w_0()
-            .gap(space::S4)
-            .child(group_label(name.to_owned()))
-            .child(
-                Input::new(&self.inputs[key].0)
-                    .aria_label(name.to_owned())
-                    .readonly(readonly)
-                    .w_full()
-                    .min_w_0(),
-            )
+    fn field(&self, key: &str, name: &str, readonly: bool, cx: &Context<Self>) -> gpui_kit::Div {
+        lumakit_gpui::providers::field(
+            name.to_owned(),
+            Input::new(&self.inputs[key].0)
+                .aria_label(name.to_owned())
+                .readonly(readonly)
+                .w_full()
+                .min_w_0(),
+            &lumakit_design::LumaTheme::global(cx).roles,
+        )
     }
     fn action(
         &self,
@@ -486,76 +332,4 @@ fn parse<T: Copy + FromStr>(
     };
     *target = value;
     Ok(())
-}
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn invalid_numeric_draft_preserves_saved_value() {
-        let mut price = Some(2.0);
-        assert!(parse("NaN", &mut price, true, valid_price).is_err());
-        assert_eq!(price, Some(2.0));
-        assert!(parse("", &mut price, false, valid_price).is_ok());
-        assert_eq!(price, None);
-        let mut tokens = Some(1024_u32);
-        assert!(parse("-1", &mut tokens, true, |v| v >= 1024).is_err());
-        assert_eq!(tokens, Some(1024));
-        assert!(parse("", &mut tokens, false, |v| v > 0).is_ok());
-        assert_eq!(tokens, None);
-        assert!(parse("0", &mut tokens, false, |v| v > 0).is_err());
-        assert_eq!(tokens, None);
-    }
-}
-
-#[cfg(test)]
-mod capability_tests {
-    use super::*;
-    #[test]
-    fn capability_choices_override_catalog_without_selecting_request_effort() {
-        let mut model = ModelEntry {
-            id: "gpt-6.1-sol".into(),
-            capabilities: Default::default(),
-            manual: true,
-            settings: Default::default(),
-        };
-        for capability in [
-            Capability::Reasoning,
-            Capability::Tools,
-            Capability::Vision,
-            Capability::Audio,
-            Capability::Video,
-        ] {
-            set_capability(&mut model, capability, false);
-        }
-        let off = model.effective_settings(Protocol::OpenAiChat);
-        assert!(
-            !off.supports_reasoning()
-                && !off.supports_vision
-                && !off.supports_audio
-                && !off.supports_video
-        );
-        assert_eq!(off.supports_tools, Some(false));
-        for capability in [
-            Capability::Reasoning,
-            Capability::Tools,
-            Capability::Vision,
-            Capability::Audio,
-            Capability::Video,
-        ] {
-            set_capability(&mut model, capability, true);
-        }
-        let restored: ModelEntry =
-            serde_json::from_str(&serde_json::to_string(&model).unwrap()).unwrap();
-        let on = restored.effective_settings(Protocol::OpenAiChat);
-        assert!(
-            on.supports_reasoning() && on.supports_vision && on.supports_audio && on.supports_video
-        );
-        assert_eq!(on.supports_tools, Some(true));
-        assert!(on.reasoning_effort.is_none());
-        let mut unknown = model;
-        unknown.id = "unknown-model".into();
-        let declared = unknown.effective_settings(Protocol::OpenAiChat);
-        assert!(declared.supports_reasoning());
-        assert!(declared.reasoning.is_none()); // A capability declaration does not invent a wire protocol.
-    }
 }

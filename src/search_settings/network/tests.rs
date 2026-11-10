@@ -264,3 +264,168 @@ fn mcp_sse_multiline_json_and_errors_remain_bounded_contracts() {
         assert!(!error.contains("private-key"));
     }
 }
+
+fn disabled_corrupt_key() -> SavedKey {
+    SavedKey {
+        id: "disabled-corrupt".into(),
+        label: Some("停用账户".into()),
+        enabled: false,
+        masked: "****".into(),
+        ciphertext: vec![0],
+    }
+}
+
+#[test]
+fn search_and_fetch_skip_disabled_selected_ciphertext() {
+    for fetch in [false, true] {
+        let (body, kind, provider) = if fetch {
+            ("Title: Found\n\nbody", "text/plain", Provider::Jina)
+        } else {
+            (
+                r#"{"results":[{"title":"Found","url":"https://example.org","content":"body"}]}"#,
+                "application/json",
+                Provider::Tavily,
+            )
+        };
+        let (endpoint, worker) = server(body.into(), kind);
+        let mut config = config(provider, endpoint, true);
+        config.keys.insert(0, disabled_corrupt_key());
+        config.selected_key = Some(config.keys[0].id.clone());
+        let trace = crate::search_settings::tests::test_trace();
+        if fetch {
+            let page = run(fetch_page(
+                config,
+                "https://example.org/page".into(),
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap();
+            assert_eq!(page.title, "Found");
+        } else {
+            let result = run(search_query(
+                config,
+                "query".into(),
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap();
+            assert_eq!(result.hits[0].title, "Found");
+        }
+        let request = worker.join().unwrap().to_ascii_lowercase();
+        assert!(request.contains("authorization: bearer test-key"));
+        assert!(!request.contains("disabled-corrupt"));
+        assert!(!request.contains("停用账户"));
+    }
+}
+
+#[test]
+fn all_disabled_credentials_reject_before_any_network_including_optional_providers() {
+    for provider in catalog::SEARCH_PROVIDERS
+        .into_iter()
+        .chain(catalog::FETCH_PROVIDERS)
+        .filter(|provider| *provider != Provider::Direct)
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let mut config = config(provider, endpoint.clone(), false);
+        config.keys.push(disabled_corrupt_key());
+        config.selected_key = Some(config.keys[0].id.clone());
+        let trace = crate::search_settings::tests::test_trace();
+        let error = if provider.is_fetch() {
+            run(fetch_page(
+                config,
+                endpoint,
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap_err()
+        } else {
+            run(search_query(
+                config,
+                "private-query".into(),
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap_err()
+        };
+        assert_eq!(error.code(), "SETTINGS_NO_ENABLED_KEY", "{provider:?}");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        let notice = error.notice(&trace);
+        assert!(!notice.contains("private-query"));
+        assert!(!notice.contains("disabled-corrupt"));
+    }
+}
+
+#[test]
+fn optional_search_without_saved_keys_preserves_anonymous_and_basic_password_semantics() {
+    for provider in [Provider::Searxng, Provider::ExaMcp] {
+        let body = if provider == Provider::Searxng {
+            r#"{"results":[{"title":"Found","url":"https://example.org","content":"body"}]}"#.into()
+        } else {
+            mcp_value().to_string()
+        };
+        let (endpoint, worker) = server(body, "application/json");
+        let result = run(search_query(
+            config(provider, endpoint, false),
+            "query".into(),
+            SearchPreferences::default(),
+            CancellationToken::new(),
+            &crate::search_settings::tests::test_trace(),
+        ))
+        .unwrap();
+        assert_eq!(result.hits[0].title, "Found");
+        let request = worker.join().unwrap().to_ascii_lowercase();
+        if provider == Provider::Searxng {
+            assert!(request.contains("authorization: basic ywxpy2u6"));
+        } else {
+            assert!(!request.contains("authorization:"));
+        }
+    }
+}
+
+#[test]
+fn required_provider_without_saved_keys_rejects_without_network() {
+    for provider in catalog::SEARCH_PROVIDERS
+        .into_iter()
+        .chain(catalog::FETCH_PROVIDERS)
+        .filter(|provider| provider.requires_key())
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let config = config(provider, endpoint.clone(), false);
+        let trace = crate::search_settings::tests::test_trace();
+        let error = if provider.is_fetch() {
+            run(fetch_page(
+                config,
+                endpoint,
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap_err()
+        } else {
+            run(search_query(
+                config,
+                "query".into(),
+                SearchPreferences::default(),
+                CancellationToken::new(),
+                &trace,
+            ))
+            .unwrap_err()
+        };
+        assert_eq!(error.code(), "SETTINGS_KEY_NOT_SAVED");
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+}

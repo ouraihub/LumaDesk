@@ -43,6 +43,8 @@ impl Stored {
                             .into_iter()
                             .map(|key| SavedKey {
                                 id: key.id,
+                                label: key.label,
+                                enabled: key.enabled,
                                 masked: key.masked,
                                 ciphertext: key.ciphertext,
                             })
@@ -77,6 +79,8 @@ impl Stored {
                             .iter()
                             .map(|key| SearchKeyRow {
                                 id: key.id.clone(),
+                                label: key.label.clone(),
+                                enabled: key.enabled,
                                 masked: key.masked.clone(),
                                 ciphertext: key.ciphertext.clone(),
                             })

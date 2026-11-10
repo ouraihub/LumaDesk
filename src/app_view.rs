@@ -13,6 +13,9 @@ impl Render for DesktopApp {
             .items_center()
             .gap(space::S4)
             .min_w_0()
+            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                this.clear_navigation_secrets(window, cx);
+            }))
             .overflow_x_scroll();
         for (index, tab) in self.tabs.iter().copied().enumerate() {
             let title = match tab {
@@ -59,17 +62,23 @@ impl Render for DesktopApp {
                 .gap(space::S4)
                 .child(tabs)
                 .child(
-                    div().id("new-tab-area").occlude().child(
-                        Button::new("new-tab")
-                            .icon(IconName::Plus)
-                            .accessibility_label("打开启动台")
-                            .tooltip("打开启动台")
-                            .small()
-                            .ghost()
-                            .on_click(
-                                cx.listener(|this, _, window, cx| this.launchpad(window, cx)),
-                            ),
-                    ),
+                    div()
+                        .id("new-tab-area")
+                        .occlude()
+                        .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                            this.clear_navigation_secrets(window, cx);
+                        }))
+                        .child(
+                            Button::new("new-tab")
+                                .icon(IconName::Plus)
+                                .accessibility_label("打开启动台")
+                                .tooltip("打开启动台")
+                                .small()
+                                .ghost()
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.launchpad(window, cx)),
+                                ),
+                        ),
                 )
                 .child(div().flex_1())
                 .child(
@@ -79,6 +88,9 @@ impl Render for DesktopApp {
                         .flex()
                         .items_center()
                         .gap(space::S4)
+                        .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                            this.clear_navigation_secrets(window, cx);
+                        }))
                         .child(
                             Button::new("appearance")
                                 .icon(IconName::Palette)
@@ -105,17 +117,23 @@ impl Render for DesktopApp {
             let query = self.settings_query.read(cx).value().trim().to_lowercase();
             // Narrow windows stack: the same items become a wrapping row above the page.
             let mut nav = if narrow { ui::nav_row(&r) } else { ui::nav(&r) }
-                .child(ui::nav_item(
-                    "settings-return",
-                    IconName::ArrowLeft,
-                    "返回",
-                    false,
-                    &r,
-                    cx.listener(|this, _, window, cx| {
-                        this.leave_settings(window, cx);
-                        cx.notify();
-                    }),
-                ))
+                .child(
+                    div()
+                        .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                            this.clear_navigation_secrets(window, cx);
+                        }))
+                        .child(ui::nav_item(
+                            "settings-return",
+                            IconName::ArrowLeft,
+                            "返回",
+                            false,
+                            &r,
+                            cx.listener(|this, _, window, cx| {
+                                this.leave_settings(window, cx);
+                                cx.notify();
+                            }),
+                        )),
+                )
                 .child(
                     div()
                         .when(narrow, |d| d.w(ui::INLINE_SEARCH))
@@ -139,7 +157,7 @@ impl Render for DesktopApp {
                 }
                 found = true;
                 for (item, (target, icon, title, _)) in matches.into_iter().enumerate() {
-                    nav = nav.child(if target == SettingsPage::Usage {
+                    let item_view = if target == SettingsPage::Usage {
                         Button::new("settings-usage")
                             .small()
                             .ghost()
@@ -164,7 +182,16 @@ impl Render for DesktopApp {
                                 this.open_settings(target, window, cx)
                             }),
                         )
-                    });
+                    };
+                    nav = nav.child(
+                        div()
+                            .capture_any_mouse_down(cx.listener(move |this, _, window, cx| {
+                                if this.settings != Some(target) {
+                                    this.clear_navigation_secrets(window, cx);
+                                }
+                            }))
+                            .child(item_view),
+                    );
                 }
             }
             if !found {
@@ -319,5 +346,20 @@ impl Render for DesktopApp {
         root(r)
             .child(top)
             .child(div().flex_1().min_h_0().child(content))
+    }
+}
+
+impl DesktopApp {
+    /// Clear credential drafts before pointer navigation can trigger input Blur submission.
+    fn clear_navigation_secrets(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.settings {
+            Some(SettingsPage::Models) => self
+                .models
+                .update(cx, |models, cx| models.clear_secrets(window, cx)),
+            Some(SettingsPage::Search) => self
+                .search
+                .update(cx, |search, cx| search.clear_secrets(window, cx)),
+            _ => {}
+        }
     }
 }

@@ -1,6 +1,6 @@
 //! 设置草稿与已保存目录分开，聊天不直接读取设置控件。
 use gpui_kit::{App, Context, Entity, Window};
-use lumakit_support::secrets::{SavedKey, new_id};
+use lumakit_support::secrets::{SavedKey, new_id, normalize_key_label};
 mod catalog_refresh;
 mod data;
 mod detection;
@@ -97,9 +97,11 @@ impl SettingsFile {
 #[derive(Default)]
 struct KeyDraft {
     value: Zeroizing<String>,
+    label: String,
     editing: Option<String>,
     revealed: Option<Zeroizing<String>>,
     revealed_key: Option<String>,
+    submitted: bool,
 }
 #[derive(Clone)]
 struct DetectConfig {

@@ -84,6 +84,20 @@ pub(super) fn project(file: &SettingsFile) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) fn primary_key(endpoint: &EndpointEntry) -> Option<&SavedKey> {
+    endpoint
+        .selected_key
+        .as_ref()
+        .and_then(|id| {
+            endpoint
+                .keys
+                .iter()
+                .find(|key| key.enabled && &key.id == id)
+        })
+        .or_else(|| endpoint.keys.iter().find(|key| key.enabled))
+        .or_else(|| endpoint.keys.first())
+}
+
 pub(super) fn model_options(file: &SettingsFile) -> Vec<ModelOption> {
     model_options_for(file, ModelType::Chat)
 }
@@ -107,7 +121,10 @@ pub(super) fn model_options_for(file: &SettingsFile, kind: ModelType) -> Vec<Mod
                         provider: p.name.clone(),
                         endpoint: e.name.clone(),
                         settings: m.effective_settings(e.protocol),
-                        has_key: e.keys.iter().any(|key| !key.ciphertext.is_empty()),
+                        has_key: e
+                            .keys
+                            .iter()
+                            .any(|key| key.enabled && !key.ciphertext.is_empty()),
                     })
             })
         })

@@ -7,7 +7,7 @@ const DATABASE: &str = "settings.db";
 const APPEARANCE_MARKER: &str = "appearance-v1";
 const SEARCH_MARKER: &str = "search-v1";
 const MCP_MARKER: &str = "mcp-v1";
-const MIGRATIONS: [lumakit_support::sqlite::Migration; 2] = [
+const MIGRATIONS: [lumakit_support::sqlite::Migration; 3] = [
     lumakit_support::sqlite::Migration {
         version: 1,
         sql: "CREATE TABLE IF NOT EXISTS prefs (key TEXT PRIMARY KEY, value TEXT NOT NULL CHECK (json_valid(value)), updated_at INTEGER NOT NULL DEFAULT (unixepoch()));
@@ -20,11 +20,18 @@ const MIGRATIONS: [lumakit_support::sqlite::Migration; 2] = [
         version: 2,
         sql: "ALTER TABLE search_configs ADD COLUMN selected_key TEXT;",
     },
+    lumakit_support::sqlite::Migration {
+        version: 3,
+        sql: "ALTER TABLE search_keys ADD COLUMN label TEXT;
+              ALTER TABLE search_keys ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1));",
+    },
 ];
 
 #[derive(Clone)]
 pub(crate) struct SearchKeyRow {
     pub id: String,
+    pub label: Option<String>,
+    pub enabled: bool,
     pub masked: String,
     pub ciphertext: Vec<u8>,
 }
@@ -198,7 +205,7 @@ pub(crate) fn load_search(root: &Path) -> Result<Option<SearchData>, String> {
         let mut keys = Vec::new();
         let mut key_statement = connection
             .prepare(
-                "SELECT id,masked,ciphertext FROM search_keys WHERE provider=?1 ORDER BY rowid",
+                "SELECT id,masked,ciphertext,label,enabled FROM search_keys WHERE provider=?1 ORDER BY rowid",
             )
             .map_err(|e| format!("无法读取搜索密钥：{e}"))?;
         let key_rows = key_statement
@@ -207,6 +214,8 @@ pub(crate) fn load_search(root: &Path) -> Result<Option<SearchData>, String> {
                     id: row.get(0)?,
                     masked: row.get(1)?,
                     ciphertext: row.get(2)?,
+                    label: row.get(3)?,
+                    enabled: row.get(4)?,
                 })
             })
             .map_err(|e| format!("无法读取搜索密钥：{e}"))?;
@@ -275,8 +284,8 @@ pub(crate) fn save_search(root: &Path, data: &SearchData) -> Result<(), String> 
         for key in &config.keys {
             transaction
                 .execute(
-                    "INSERT INTO search_keys(provider,id,masked,ciphertext) VALUES(?1,?2,?3,?4)",
-                    params![config.provider, key.id, key.masked, key.ciphertext],
+                    "INSERT INTO search_keys(provider,id,masked,ciphertext,label,enabled) VALUES(?1,?2,?3,?4,?5,?6)",
+                    params![config.provider, key.id, key.masked, key.ciphertext, key.label, key.enabled],
                 )
                 .map_err(|e| format!("保存搜索密钥失败：{e}"))?;
         }
@@ -342,7 +351,7 @@ mod tests {
         ));
         save_appearance(&root, &serde_json::json!({"kept":true})).unwrap();
         let connection = Connection::open(database(&root)).unwrap();
-        connection.execute_batch("PRAGMA user_version=3;").unwrap();
+        connection.execute_batch("PRAGMA user_version=4;").unwrap();
         assert!(load_appearance(&root).is_err());
         assert!(load_search(&root).is_err());
         assert!(save_appearance(&root, &Value::Null).is_err());
@@ -360,7 +369,7 @@ mod tests {
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            4
         );
         drop(connection);
         std::fs::remove_dir_all(root).unwrap();

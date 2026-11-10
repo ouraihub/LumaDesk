@@ -60,11 +60,67 @@ fn display_name_and_model_type_change_picker_without_changing_wire_id() {
 fn key_reveal_replace_and_failure_preserve_secret_contract() {
     let root = std::env::temp_dir().join(format!("lumadesk-inline-key-test-{}", new_id().unwrap()));
     let mut settings = ModelSettings::load(&root).unwrap();
-    let key = SavedKey::new("inline-original").unwrap();
-    let id = key.id.clone();
     let endpoint = settings.draft.providers[0].endpoints[0].id.clone();
-    settings.draft.providers[0].endpoints[0].keys.push(key);
-    settings.save().unwrap();
+    settings.key_drafts.insert(
+        endpoint.clone(),
+        KeyDraft {
+            label: "  主账户  ".into(),
+            value: Zeroizing::new("inline-original".into()),
+            ..Default::default()
+        },
+    );
+    settings.save_key(0, 0);
+    assert!(!settings.error);
+    let id = settings.saved.providers[0].endpoints[0].keys[0].id.clone();
+    assert!(settings.saved.providers[0].endpoints[0].keys[0].enabled);
+    settings.set_key_enabled(0, 0, &id, false);
+    assert!(!settings.error);
+    let original_ciphertext = settings.saved.providers[0].endpoints[0].keys[0]
+        .ciphertext
+        .clone();
+    let draft = settings.key_drafts.get_mut(&endpoint).unwrap();
+    draft.label = "备用账户".into();
+    *draft.value = "backup-secret".into();
+    settings.save_key(0, 0);
+    assert!(!settings.error);
+    let second_id = settings.saved.providers[0].endpoints[0].keys[1].id.clone();
+    let restored = ModelSettings::load(&root).unwrap();
+    let keys = &restored.saved.providers[0].endpoints[0].keys;
+    assert_eq!(keys[0].label.as_deref(), Some("主账户"));
+    assert_eq!(keys[1].label.as_deref(), Some("备用账户"));
+    assert_eq!(keys[1].id, second_id);
+    assert_eq!(keys[1].open().unwrap().as_str(), "backup-secret");
+    drop(restored);
+    let draft = settings.key_drafts.get_mut(&endpoint).unwrap();
+    draft.label = "  生产账户  ".into();
+    draft.editing = Some(id.clone());
+    assert!(draft.value.is_empty());
+    assert!(settings.submit_key());
+    assert!(settings.key_drafts[&endpoint].label.is_empty());
+    let renamed = ModelSettings::load(&root).unwrap();
+    let key = &renamed.saved.providers[0].endpoints[0].keys[0];
+    assert_eq!(key.id, id);
+    assert_eq!(key.label.as_deref(), Some("生产账户"));
+    assert_eq!(key.ciphertext, original_ciphertext);
+    assert!(!key.enabled);
+    assert_eq!(key.open().unwrap().as_str(), "inline-original");
+    drop(renamed);
+    for label in ["bad\nlabel".to_owned(), "密".repeat(129)] {
+        let draft = settings.key_drafts.get_mut(&endpoint).unwrap();
+        draft.label = label.clone();
+        draft.editing = Some(id.clone());
+        *draft.value = "must-not-replace".into();
+        settings.save_key(0, 0);
+        assert!(settings.error);
+        let key = &settings.draft.providers[0].endpoints[0].keys[0];
+        assert_eq!(key.label.as_deref(), Some("生产账户"));
+        assert_eq!(key.ciphertext, original_ciphertext);
+        assert_eq!(settings.key_drafts[&endpoint].label, label);
+        assert_eq!(
+            settings.key_drafts[&endpoint].value.as_str(),
+            "must-not-replace"
+        );
+    }
     settings.reveal_key(0, 0, &id);
     assert_eq!(
         settings.key_drafts[&endpoint]
@@ -78,17 +134,42 @@ fn key_reveal_replace_and_failure_preserve_secret_contract() {
     assert!(settings.key_drafts[&endpoint].revealed.is_none());
     let draft = settings.key_drafts.get_mut(&endpoint).unwrap();
     draft.editing = Some(id.clone());
+    draft.label = "生产账户".into();
     *draft.value = "replacement".into();
     let original_url = settings.saved.providers[0].endpoints[0].base_url.clone();
     settings.draft.providers[0].endpoints[0].base_url = "unfinished address".into();
     settings.dirty = true;
-    settings.save_key(0, 0);
+    settings.editor = Some(EditorDialog::Keys {
+        provider: settings.draft.providers[0].id.clone(),
+        endpoint: endpoint.clone(),
+    });
+    settings.provider = Some(settings.draft.providers[1].id.clone());
+    settings.repair_selection();
+    assert!(settings.submit_key());
+    assert!(!settings.submit_key()); // Enter followed by Blur cannot save an empty second key.
     assert!(
         settings.key_drafts[&endpoint].value.is_empty()
+            && settings.key_drafts[&endpoint].label.is_empty()
             && settings.key_drafts[&endpoint].revealed.is_none()
     );
     let restored = ModelSettings::load(&root).unwrap();
     assert_eq!(restored.saved.providers[0].endpoints[0].keys[0].id, id);
+    assert_eq!(
+        restored.saved.providers[0].endpoints[0].keys[0]
+            .label
+            .as_deref(),
+        Some("生产账户")
+    );
+    assert_eq!(
+        restored.saved.providers[0].endpoints[0].keys[1]
+            .label
+            .as_deref(),
+        Some("备用账户")
+    );
+    assert_eq!(
+        restored.saved.providers[0].endpoints[0].keys[1].id,
+        second_id
+    );
     assert_eq!(
         restored.saved.providers[0].endpoints[0].keys[0]
             .open()
@@ -96,6 +177,7 @@ fn key_reveal_replace_and_failure_preserve_secret_contract() {
             .as_str(),
         "replacement"
     );
+    assert!(!restored.saved.providers[0].endpoints[0].keys[0].enabled);
     assert_eq!(
         restored.saved.providers[0].endpoints[0].base_url,
         original_url
@@ -107,10 +189,11 @@ fn key_reveal_replace_and_failure_preserve_secret_contract() {
     assert!(settings.dirty);
     let draft = settings.key_drafts.get_mut(&endpoint).unwrap();
     draft.editing = Some(id.clone());
+    draft.label = "未保存标签".into();
     *draft.value = "uncommitted".into();
     let db = rusqlite::Connection::open(root.join("providers.db")).unwrap();
     db.execute_batch("CREATE TRIGGER deny_key BEFORE UPDATE ON endpoint_keys BEGIN SELECT RAISE(ABORT,'test write failure'); END;").unwrap();
-    settings.save_key(0, 0);
+    assert!(!settings.submit_key());
     assert_eq!(
         settings.draft.providers[0].endpoints[0].keys[0]
             .open()
@@ -119,6 +202,19 @@ fn key_reveal_replace_and_failure_preserve_secret_contract() {
         "replacement"
     );
     assert_eq!(settings.key_drafts[&endpoint].value.as_str(), "uncommitted");
+    assert_eq!(settings.key_drafts[&endpoint].label, "未保存标签");
+    assert_eq!(
+        settings.draft.providers[0].endpoints[0].keys[0]
+            .label
+            .as_deref(),
+        Some("生产账户")
+    );
+    assert!(settings.key_drafts[&endpoint].submitted);
+    assert_eq!(
+        settings.key_drafts[&endpoint].editing.as_deref(),
+        Some(id.as_str())
+    );
+    assert!(settings.draft.providers[1].endpoints[0].keys.is_empty());
     settings.clear_drafts();
     assert!(settings.key_drafts.is_empty());
     drop(db);
@@ -215,6 +311,143 @@ fn enable_is_independent_of_invalid_address_and_restores_on_write_failure() {
     drop(restored);
     drop(settings);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn key_enable_is_independent_and_rolls_back_failed_persistence() {
+    let root = std::env::temp_dir().join(format!("lumadesk-key-enable-{}", new_id().unwrap()));
+    let mut settings = ModelSettings::load(&root).unwrap();
+    settings.draft.providers[0].enabled = true;
+    let endpoint = &mut settings.draft.providers[0].endpoints[0];
+    endpoint.keys.push(SavedKey {
+        id: "toggle-key".into(),
+        label: Some("主账户".into()),
+        enabled: true,
+        masked: "••••key".into(),
+        ciphertext: "opaque-ciphertext".into(),
+    });
+    endpoint.selected_key = Some("toggle-key".into());
+    endpoint.models.push(ModelEntry {
+        id: "test-model".into(),
+        capabilities: unknown_capabilities(),
+        manual: true,
+        settings: Default::default(),
+    });
+    let endpoint_id = endpoint.id.clone();
+    let original_url = endpoint.base_url.clone();
+    settings.save().unwrap();
+    assert!(settings.available_models()[0].has_key);
+    settings.draft.providers[0].endpoints[0].base_url = "unfinished address".into();
+    settings.dirty = true;
+    settings.key_drafts.insert(
+        endpoint_id.clone(),
+        KeyDraft {
+            label: "未保存标签".into(),
+            value: Zeroizing::new("uncommitted-secret".into()),
+            editing: Some("toggle-key".into()),
+            ..Default::default()
+        },
+    );
+    settings.set_key_enabled(0, 0, "toggle-key", false);
+    assert!(!settings.error);
+    assert!(!settings.available_models()[0].has_key);
+    assert!(!settings.draft.providers[0].endpoints[0].keys[0].enabled);
+    assert_eq!(
+        settings.draft.providers[0].endpoints[0].base_url,
+        "unfinished address"
+    );
+    assert!(settings.dirty);
+    assert_eq!(settings.key_drafts[&endpoint_id].label, "未保存标签");
+    assert_eq!(
+        settings.key_drafts[&endpoint_id].value.as_str(),
+        "uncommitted-secret"
+    );
+    let restored = ModelSettings::load(&root).unwrap();
+    let endpoint = &restored.saved.providers[0].endpoints[0];
+    assert_eq!(endpoint.base_url, original_url);
+    assert_eq!(endpoint.selected_key.as_deref(), Some("toggle-key"));
+    let key = &endpoint.keys[0];
+    assert!(!key.enabled);
+    assert_eq!(key.id, "toggle-key");
+    assert_eq!(key.label.as_deref(), Some("主账户"));
+    assert_eq!(key.ciphertext, b"opaque-ciphertext");
+    let db = rusqlite::Connection::open(root.join("providers.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER deny_toggle BEFORE UPDATE ON endpoint_keys BEGIN SELECT RAISE(ABORT,'test write failure'); END;").unwrap();
+    settings.set_key_enabled(0, 0, "toggle-key", true);
+    assert!(settings.error);
+    assert!(!settings.draft.providers[0].endpoints[0].keys[0].enabled);
+    assert!(!settings.saved.providers[0].endpoints[0].keys[0].enabled);
+    assert!(!settings.available_models()[0].has_key);
+    let restored_after_failure = ModelSettings::load(&root).unwrap();
+    assert!(!restored_after_failure.saved.providers[0].endpoints[0].keys[0].enabled);
+    drop(restored_after_failure);
+    drop(db);
+    drop(restored);
+    drop(settings);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn primary_key_prefers_enabled_selection_then_enabled_then_stored() {
+    let key = |id: &str, enabled| SavedKey {
+        id: id.into(),
+        label: None,
+        enabled,
+        masked: "••••".into(),
+        ciphertext: "opaque".into(),
+    };
+    let mut endpoint = EndpointEntry {
+        id: "endpoint".into(),
+        name: "测试".into(),
+        base_url: "http://127.0.0.1/v1".into(),
+        protocol: Protocol::OpenAiChat,
+        keys: vec![
+            key("disabled", false),
+            key("first-enabled", true),
+            key("selected", true),
+        ],
+        models: Vec::new(),
+        selected_key: Some("selected".into()),
+        selected_model: None,
+    };
+    assert_eq!(primary_key(&endpoint).unwrap().id, "selected");
+    endpoint.keys[2].enabled = false;
+    assert_eq!(primary_key(&endpoint).unwrap().id, "first-enabled");
+    endpoint.keys[1].enabled = false;
+    assert_eq!(primary_key(&endpoint).unwrap().id, "disabled");
+    endpoint.keys.clear();
+    assert!(primary_key(&endpoint).is_none());
+}
+
+#[test]
+fn all_disabled_detection_fails_before_opening_secret_or_network() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut endpoint = EndpointEntry {
+        id: "disabled".into(),
+        name: "全部停用".into(),
+        base_url: format!("http://{}/v1", listener.local_addr().unwrap()),
+        protocol: Protocol::OpenAiChat,
+        keys: vec![SavedKey {
+            id: "disabled-key".into(),
+            label: None,
+            enabled: false,
+            masked: "••••".into(),
+            ciphertext: "invalid-ciphertext".into(),
+        }],
+        models: Vec::new(),
+        selected_key: Some("disabled-key".into()),
+        selected_model: None,
+    };
+    let error = detect_models(&endpoint, CancellationToken::new(), &test_trace()).unwrap_err();
+    assert_eq!(error.code(), "SETTINGS_NO_ENABLED_KEY");
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    endpoint.base_url = "unfinished address".into();
+    let error = detect_models(&endpoint, CancellationToken::new(), &test_trace()).unwrap_err();
+    assert_eq!(error.code(), "SETTINGS_NO_ENABLED_KEY");
 }
 
 #[test]
@@ -413,13 +646,20 @@ fn actual_loopback_detection_auth_failover_and_encrypted_reload() {
     });
     let first = SavedKey::new("first-key").unwrap();
     let second = SavedKey::new("second-key").unwrap();
+    let disabled = SavedKey {
+        id: "disabled-key".into(),
+        label: Some("停用账户".into()),
+        enabled: false,
+        masked: "••••".into(),
+        ciphertext: "invalid-ciphertext".into(),
+    };
     let endpoint = EndpointEntry {
         id: new_id().unwrap(),
         name: "回环".into(),
         base_url: format!("http://{address}/v1"),
         protocol: Protocol::OpenAiChat,
-        selected_key: Some(first.id.clone()),
-        keys: vec![first, second],
+        selected_key: Some(disabled.id.clone()),
+        keys: vec![first, disabled, second],
         models: Vec::new(),
         selected_model: None,
     };
@@ -710,6 +950,7 @@ fn unauthorized_without_saved_key_says_save_the_key_first() {
         error.to_string().contains("没有已保存的密钥") && error.to_string().contains("401"),
         "{error}"
     );
+    assert_eq!(error.code(), "SETTINGS_KEY_NOT_SAVED");
     assert!(
         !server
             .join()

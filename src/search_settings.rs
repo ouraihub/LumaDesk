@@ -3,7 +3,7 @@ use crate::settings_store::{self, SearchConfigRow, SearchData, SearchKeyRow};
 use gpui_kit::component::input::{InputEvent, InputState, TextareaState};
 use gpui_kit::{AppContext, Context, Entity, Subscription, Window};
 use lumakit_ai::search::{SearchPreferences, SearchResult};
-use lumakit_support::secrets::SavedKey;
+use lumakit_support::secrets::{SavedKey, normalize_key_label};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
@@ -36,7 +36,7 @@ struct Config {
     keys: Vec<SavedKey>,
     #[serde(default)]
     username: String,
-    /// Requests start from this key, then rotate in list order; `None` means the first key.
+    /// Legacy request preference, used only while the selected credential remains enabled.
     #[serde(default)]
     selected_key: Option<String>,
 }
@@ -59,6 +59,9 @@ struct Draft {
     endpoint: String,
     username: String,
     key: String,
+    label: String,
+    submitted: bool,
+    generation: u64,
     editing: Option<String>,
     revealed: Option<(String, String)>,
 }
@@ -68,12 +71,18 @@ impl Draft {
             endpoint: config.endpoint.clone(),
             username: config.username.clone(),
             key: String::new(),
+            label: String::new(),
+            submitted: false,
+            generation: 0,
             editing: None,
             revealed: None,
         }
     }
     fn clear(&mut self) {
         self.key.zeroize();
+        self.label.clear();
+        self.submitted = false;
+        self.generation = self.generation.wrapping_add(1);
         self.editing = None;
         if let Some((_, mut value)) = self.revealed.take() {
             value.zeroize();
@@ -108,12 +117,13 @@ enum KeyAction {
     Add,
     Replace(String, String),
     Delete(String),
-    Select(String),
+    SetEnabled(String, bool),
 }
 struct ProviderInputs {
     endpoint: Entity<InputState>,
     username: Entity<InputState>,
     key: Entity<InputState>,
+    label: Entity<InputState>,
 }
 struct SearchInputs {
     providers: Vec<ProviderInputs>,
@@ -254,6 +264,9 @@ impl SearchSettings {
                 provider
                     .key
                     .update(cx, |input, cx| input.set_value("", window, cx));
+                provider
+                    .label
+                    .update(cx, |input, cx| input.set_value("", window, cx));
             }
         }
         cx.notify();
@@ -278,6 +291,9 @@ impl SearchSettings {
         if let Some(inputs) = &self.inputs {
             inputs.providers[index]
                 .key
+                .update(cx, |input, cx| input.set_value("", window, cx));
+            inputs.providers[index]
+                .label
                 .update(cx, |input, cx| input.set_value("", window, cx));
         }
     }
@@ -390,6 +406,7 @@ fn validate_stored(value: &Stored) -> Result<(), String> {
             if key.id.is_empty() || key.ciphertext.is_empty() || !seen.insert(&key.id) {
                 return Err("密钥配置无效".into());
             }
+            normalize_key_label(key.label.as_deref().unwrap_or_default())?;
         }
         if config
             .selected_key

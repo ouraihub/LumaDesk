@@ -15,7 +15,7 @@ impl ModelSettings {
         })
     }
 
-    /// API 密钥 · 获取密钥; the selected key's value box (or the first-key input), key management and 检测.
+    /// API 密钥 · 获取密钥; the first enabled key (or the first-key input), management and 检测.
     pub(super) fn key_section(&self, p: usize, e: usize, cx: &Context<Self>) -> gpui_kit::Div {
         let r = roles(cx);
         let provider = &self.draft.providers[p];
@@ -31,39 +31,38 @@ impl ModelSettings {
             })
             .into_iter()
             .collect();
-        let manage = ui::key_manage_button("manage-keys")
-            .on_click(Self::listen(cx, move |this, window, cx| {
-                this.open_keys(p, e, window, cx)
-            }));
+        let manage = div()
+            .on_mouse_down(
+                gpui_kit::MouseButton::Left,
+                cx.listener(move |this, _, window, cx| {
+                    if this.job.is_none() {
+                        this.open_keys(p, e, window, cx);
+                        cx.notify();
+                    }
+                }),
+            )
+            .child(
+                ui::key_manage_button("manage-keys")
+                    .disabled(self.job.is_some())
+                    .on_click(Self::listen(cx, move |this, window, cx| {
+                        if this.editor.is_none() {
+                            this.open_keys(p, e, window, cx);
+                        }
+                    })),
+            );
         let detect = self
             .button("detect", "检测", cx, |this, _, _| this.start_job(false))
             .outline()
-            .disabled(self.dirty);
+            .disabled(self.dirty || self.job.is_some());
         // The key input is one entity: while a dialog shows it, the main row must not.
-        let value = if !endpoint.keys.is_empty() {
-            let key = endpoint
-                .selected_key
-                .as_ref()
-                .and_then(|id| endpoint.keys.iter().find(|key| &key.id == id))
-                .unwrap_or(&endpoint.keys[0]);
+        let value = if let Some(key) = primary_key(endpoint) {
             self.key_row(p, e, key, false, cx)
                 .more(endpoint.keys.len() - 1)
                 .into_any_element()
         } else if self.editor.is_none() {
-            h_flex()
+            self.input("key")
+                .disabled(self.job.is_some())
                 .flex_1()
-                .min_w(px(0.))
-                .gap(space::S8)
-                .child(self.input("key").flex_1())
-                .child(
-                    self.button(
-                        "save-primary-key",
-                        "加密保存",
-                        cx,
-                        |this, window, cx| this.save_key_input(window, cx),
-                    )
-                    .primary(),
-                )
                 .into_any_element()
         } else {
             h_flex()
@@ -71,16 +70,53 @@ impl ModelSettings {
                 .child(hint("尚未保存密钥", &r))
                 .into_any_element()
         };
-        v_flex()
-            .gap(space::S8)
-            .child(ui::field_title("API 密钥", links, &r))
-            .child(
-                h_flex()
+        let progress = self.job.as_ref().map(|job| {
+            h_flex()
+                .gap(space::S8)
+                .flex_wrap()
+                .child(hint(
+                    if job.cancel.is_cancelled() {
+                        "正在取消请求…"
+                    } else {
+                        "正在检测已保存的线路…"
+                    },
+                    &r,
+                ))
+                .child(
+                    self.button("cancel-job", "取消请求", cx, |this, _, _| {
+                        if let Some(job) = &this.job {
+                            job.cancel.cancel();
+                        }
+                    })
+                    .outline()
+                    .icon(IconName::X)
+                    .disabled(job.cancel.is_cancelled()),
+                )
+                .into_any_element()
+        });
+        let result = progress.or_else(|| self.status(cx).map(IntoElement::into_any_element));
+        let result = if !endpoint.keys.is_empty() && !endpoint.keys.iter().any(|key| key.enabled) {
+            Some(
+                v_flex()
                     .gap(space::S8)
-                    .child(value)
-                    .child(manage)
-                    .child(detect),
+                    .children(result)
+                    .child(hint(
+                        "所有密钥均已停用；请在密钥管理中启用至少一个密钥。",
+                        &r,
+                    ))
+                    .into_any_element(),
             )
+        } else {
+            result
+        };
+        shared::key_section(
+            links,
+            value,
+            manage.into_any_element(),
+            detect.into_any_element(),
+            result,
+            &r,
+        )
     }
 
     fn open_keys(&mut self, p: usize, e: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -94,8 +130,7 @@ impl ModelSettings {
         );
     }
 
-    /// One saved key. In the page row only the eye shows until revealed; in the keys dialog every
-    /// action shows, plus 使用此密钥 when there is a choice.
+    /// Saved key label and mask; reveal is page-only, delete is manager-only.
     fn key_row(
         &self,
         p: usize,
@@ -109,10 +144,11 @@ impl ModelSettings {
             .key_drafts
             .get(&endpoint.id)
             .filter(|d| d.revealed_key.as_ref() == Some(&key.id))
+            .filter(|_| !in_dialog)
             .and_then(|d| d.revealed.as_ref());
         let shown = revealed.map_or_else(|| key.masked.clone(), |value| value.to_string());
         let is_revealed = revealed.is_some();
-        let (reveal_id, copy_id, edit_id, delete_id, select_id) = (
+        let (reveal_id, copy_id, edit_id, delete_id, toggle_id) = (
             key.id.clone(),
             key.id.clone(),
             key.id.clone(),
@@ -120,20 +156,10 @@ impl ModelSettings {
             key.id.clone(),
         );
         let mut row = ui::KeyRow::new(format!("key-{}", key.id), shown, is_revealed)
+            .disabled(self.job.is_some())
+            .roles(roles(cx))
+            .hover_actions(!in_dialog)
             .all_actions(in_dialog)
-            .on_reveal(Self::listen(cx, move |this, _, _| {
-                if is_revealed {
-                    if let Some(draft) = this
-                        .key_drafts
-                        .get_mut(&this.draft.providers[p].endpoints[e].id)
-                    {
-                        draft.revealed = None;
-                        draft.revealed_key = None;
-                    }
-                } else {
-                    this.reveal_key(p, e, &reveal_id);
-                }
-            }))
             .on_copy(Self::listen(cx, move |this, _, cx| {
                 let result = this.draft.providers[p].endpoints[e]
                     .keys
@@ -155,29 +181,75 @@ impl ModelSettings {
                 if !matches!(this.editor, Some(EditorDialog::Keys { .. })) {
                     this.open_keys(p, e, window, cx);
                 }
+                let Some(label) = this.draft.providers[p].endpoints[e]
+                    .keys
+                    .iter()
+                    .find(|key| key.id == edit_id)
+                    .map(|key| key.label.clone().unwrap_or_default())
+                else {
+                    this.report(Err("密钥已不存在".into()), "");
+                    return;
+                };
                 let draft = this
                     .key_drafts
                     .entry(this.draft.providers[p].endpoints[e].id.clone())
                     .or_default();
                 draft.value.zeroize();
+                draft.label = label.clone();
+                draft.submitted = false;
                 draft.editing = Some(edit_id.clone());
                 draft.revealed = None;
                 draft.revealed_key = None;
                 this.set_input("key", "", window, cx);
-            }))
-            .on_delete(Self::listen(cx, move |this, window, cx| {
+                this.set_input("key-label", label, window, cx);
+            }));
+        if let Some(label) = &key.label {
+            row = row.label(label.clone());
+        } else if in_dialog {
+            row = row.label("API Key");
+        }
+        if !in_dialog {
+            row = row.on_reveal(Self::listen(cx, move |this, _, _| {
+                if is_revealed {
+                    if let Some(draft) = this
+                        .key_drafts
+                        .get_mut(&this.draft.providers[p].endpoints[e].id)
+                    {
+                        draft.revealed = None;
+                        draft.revealed_key = None;
+                    }
+                } else {
+                    this.reveal_key(p, e, &reveal_id);
+                }
+            }));
+        }
+        if in_dialog {
+            row = row.on_delete(Self::listen(cx, move |this, window, cx| {
                 this.key_drafts.clear();
                 this.set_input("key", "", window, cx);
+                this.set_input("key-label", "", window, cx);
                 this.delete_key = Some((
                     this.draft.providers[p].id.clone(),
                     this.draft.providers[p].endpoints[e].id.clone(),
                     delete_id.clone(),
                 ));
             }));
-        if in_dialog && endpoint.keys.len() > 1 {
-            row = row.on_select(
-                endpoint.selected_key.as_ref() == Some(&key.id),
-                Self::listen(cx, move |this, _, _| this.change_key(p, e, &select_id)),
+        }
+        if in_dialog {
+            row = row.trailing(
+                Switch::new(format!("key-enabled-{}", key.id))
+                    .checked(key.enabled)
+                    .color(roles(cx).feedback_success)
+                    .disabled(self.job.is_some())
+                    .accessibility_label(format!(
+                        "启用密钥 {}",
+                        key.label.as_deref().unwrap_or(&key.masked)
+                    ))
+                    .on_click(cx.listener(move |this, enabled: &bool, _, cx| {
+                        this.set_key_enabled(p, e, &toggle_id, *enabled);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
             );
         }
         row
@@ -189,7 +261,7 @@ impl ModelSettings {
         provider: &str,
         endpoint: &str,
         cx: &Context<Self>,
-    ) -> Option<ui::KeyManager> {
+    ) -> Option<gpui_kit::Div> {
         let p = self.draft.providers.iter().position(|p| p.id == provider)?;
         let e = self.draft.providers[p]
             .endpoints
@@ -200,18 +272,67 @@ impl ModelSettings {
             .key_drafts
             .get(endpoint)
             .is_some_and(|draft| draft.editing.is_some());
-        Some(
-            ui::KeyManager::new(self.input("key"))
-                .note(format!("每条线路最多 {MAX_KEYS} 个，加密保存。"))
-                .rows(keys.iter().map(|key| self.key_row(p, e, key, true, cx)))
-                .editing(editing)
-                .on_save(Self::listen(cx, |this, window, cx| {
-                    this.save_key_input(window, cx)
-                }))
-                .on_cancel_edit(Self::listen(cx, |this, window, cx| {
-                    this.key_drafts.clear();
-                    this.set_input("key", "", window, cx);
-                })),
-        )
+        let r = roles(cx);
+        let save = self
+            .button(
+                "save-key",
+                if editing {
+                    "保存"
+                } else {
+                    "添加 API 密钥"
+                },
+                cx,
+                |this, window, cx| this.save_key_input(window, cx),
+            )
+            .primary()
+            .disabled(self.job.is_some());
+        let cancel = editing.then(|| {
+            self.button("cancel-key-edit", "取消修改", cx, |this, window, cx| {
+                this.key_drafts.clear();
+                this.set_input("key", "", window, cx);
+                this.set_input("key-label", "", window, cx);
+            })
+            .outline()
+            .disabled(self.job.is_some())
+            .into_any_element()
+        });
+        Some(shared::key_manager(
+            keys.iter()
+                .map(|key| self.key_row(p, e, key, true, cx).into_any_element()),
+            std::iter::empty(),
+            v_flex()
+                .gap(space::S8)
+                .child(shared::key_entry(
+                    self.input("key-label")
+                        .aria_label("密钥标签（可选）")
+                        .disabled(self.job.is_some())
+                        .into_any_element(),
+                    self.input("key")
+                        .aria_label("API 密钥（修改时留空保留原密钥）")
+                        .mask_toggle()
+                        .disabled(self.job.is_some())
+                        .into_any_element(),
+                    h_flex()
+                        .gap(space::S8)
+                        .flex_wrap()
+                        .child(save)
+                        .children(cancel)
+                        .into_any_element(),
+                ))
+                .child(hint(
+                    format!(
+                        "{} / {} 已启用",
+                        keys.iter().filter(|key| key.enabled).count(),
+                        keys.len()
+                    ),
+                    &r,
+                ))
+                .into_any_element(),
+            hint(
+                format!("每条线路最多 {MAX_KEYS} 个密钥；修改时留空保留原密钥。"),
+                &r,
+            )
+            .into_any_element(),
+        ))
     }
 }

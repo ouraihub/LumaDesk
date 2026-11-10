@@ -47,7 +47,7 @@ impl SearchSettings {
     pub(super) fn save(&mut self, index: usize, action: Option<KeyAction>) -> Result<(), String> {
         let mut next = self.stored.clone();
         let config = &mut next.configs[index];
-        let mut clear_added = false;
+        let mut clear_credential = false;
         match action {
             None => {
                 let endpoint = self.drafts[index].endpoint.trim();
@@ -66,30 +66,42 @@ impl SearchSettings {
             }
             Some(KeyAction::Replace(id, value)) => {
                 let value = zeroize::Zeroizing::new(value);
-                validate_key(&value)?;
+                let label = normalize_key_label(&self.drafts[index].label)?.map(str::to_owned);
+                let key = config
+                    .keys
+                    .iter_mut()
+                    .find(|key| key.id == id)
+                    .ok_or("密钥不存在")?;
+                if !value.trim().is_empty() {
+                    validate_key(&value)?;
+                    key.replace(value.trim())?;
+                }
+                key.label = label;
+                clear_credential = true;
+            }
+            Some(KeyAction::Add) => {
+                let label = normalize_key_label(&self.drafts[index].label)?.map(str::to_owned);
+                add_key(config, &self.drafts[index].key)?;
+                if let Some(key) = config.keys.last_mut() {
+                    key.label = label;
+                }
+                clear_credential = true;
+            }
+            Some(KeyAction::SetEnabled(id, enabled)) => {
                 config
                     .keys
                     .iter_mut()
                     .find(|key| key.id == id)
                     .ok_or("密钥不存在")?
-                    .replace(value.trim())?;
-            }
-            Some(KeyAction::Add) => {
-                add_key(config, &self.drafts[index].key)?;
-                clear_added = true;
-            }
-            Some(KeyAction::Select(id)) => {
-                if !config.keys.iter().any(|key| key.id == id) {
-                    return Err("密钥不存在".into());
-                }
-                config.selected_key = Some(id);
+                    .enabled = enabled;
             }
         }
         next.save(&self.root)
             .map_err(|error| format!("保存失败：{error}；草稿和原凭据均已保留"))?;
         self.stored = next;
-        if clear_added {
+        if clear_credential {
             self.drafts[index].key.zeroize();
+            self.drafts[index].label.clear();
         }
         Ok(())
     }
@@ -111,14 +123,15 @@ impl SearchSettings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        let preserve_draft = matches!(&action, KeyAction::SetEnabled(..));
         let success = match action {
             KeyAction::Add | KeyAction::Replace(..) => "密钥已加密保存",
             KeyAction::Delete(_) => "已删除",
-            KeyAction::Select(_) => "密钥选择已保存",
+            KeyAction::SetEnabled(..) => "密钥启用状态已保存",
         };
         let result = self.save(index, Some(action));
         let saved = self.report(index, result, success);
-        if saved {
+        if saved && !preserve_draft {
             self.clear_provider(index, window, cx);
         }
         saved
@@ -130,19 +143,30 @@ impl SearchSettings {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.is_busy() {
+            return;
+        }
         let Some(inputs) = &self.inputs else {
             return;
         };
-        let value = inputs.providers[index].key.read(cx).value().to_string();
-        let action = match self.drafts[index].editing.clone() {
-            Some(id) => KeyAction::Replace(id, value),
-            None => {
-                self.drafts[index].key.zeroize();
-                self.drafts[index].key = value;
-                KeyAction::Add
+        let input = &inputs.providers[index];
+        let value = zeroize::Zeroizing::new(input.key.read(cx).value().to_string());
+        self.drafts[index].label = input.label.read(cx).value().to_string();
+        self.drafts[index].key.zeroize();
+        self.drafts[index].key = value.as_str().to_owned();
+        if self.drafts[index].editing.is_none() && value.trim().is_empty() {
+            if self.key_dialog == Some(index) {
+                self.report(index, Err("密钥不能为空，原凭据未修改".into()), "");
             }
+            return;
+        }
+        self.drafts[index].submitted = true;
+        let action = match self.drafts[index].editing.clone() {
+            Some(id) => KeyAction::Replace(id, value.as_str().to_owned()),
+            None => KeyAction::Add,
         };
         self.submit_key(index, action, window, cx);
+        self.drafts[index].submitted = true;
     }
     fn report(&mut self, index: usize, result: Result<(), String>, success: &str) -> bool {
         self.card_diagnostic_trace[index] = None;
