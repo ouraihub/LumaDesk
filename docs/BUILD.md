@@ -116,7 +116,13 @@ ZIP 只含 EXE 与许可声明，从不打包用户数据。发布替换只换�
 
 代码引用工具：尝试 rust-analyzer references 时服务器退出（code 0），后续按目标符号与全部调用方搜索核对；未宣称语言服务器引用检查成功。
 
-边界：没有改UI布局，未重测320/375/414/768布局矩阵；没有在实际窗口制造panic或等待AI120秒超时，前者用独立子进程、后者沿既有超时合同与定向回归。未重跑无关Kit crate/Native workspace。此次更新源码与debug运行产物，未重新打包 `dist` 正式EXE；不要把此前发布哈希当作本次修复产物。磁盘不可写、系统强杀、访问违规等仍不能保证Rust日志落盘。
+初轮整改验收边界：没有改UI布局，未重测320/375/414/768布局矩阵；没有在实际窗口制造panic或等待AI120秒超时，前者用独立子进程、后者沿既有超时合同与定向回归。当时只验证宿主与两个共享crate及debug程序；随后完整release门禁与正式打包见下节，不将其扩大为Native复测。磁盘不可写、系统强杀、访问违规等仍不能保证Rust日志落盘。
+
+### 正式发布验证
+
+LumaKit `f4c41b5`、LumaDesk `530cbad` 已推送各自 GitHub main。随后运行 `CI=true scripts/build-app.bat` 全部完成：Kit workspace release 206项、宿主release63项通过，0失败；正式EXE、ZIP及包内EXE哈希一致性校验通过。构建标识 `0.1.0-f0933c33b54b4e58b24ffdc54e85067c`，EXE SHA-256 `9d4ab378b34be228d1cb60dc4d4d851877e40a1f39e2c2e2a6aa466e63695208`，ZIP位于 `dist/gpui/installer/0.1.0-f0933c33b54b4e58b24ffdc54e85067c/LumaDesk-GPUI_0.1.0_x64-portable.zip`。包内仅EXE和第三方许可，无用户数据。
+
+已实际启动新 `dist/LumaDesk-GPUI/LumaDesk-GPUI.exe`：空白隔离目录正常启动、打开设置→后台日志并正常退出；另一隔离目录主动放入无效appearance.json，实窗显示安全错误码与TraceId，日志同链路child WARN和唯一root ERROR，不误报app.started，正常退出码0。这是人为故障注入，不代表正式用户配置损坏。截图 `published-log-page.png`、`published-startup-failure.png` 位于 `C:/Users/Administrator/AppData/Local/Temp/lumadesk-logging-release-391sg5kr/`；未操作正式数据。本次发布冒烟不等同重测此前debug全部场景与窄窗矩阵。
 
 ## 已知问题
 
