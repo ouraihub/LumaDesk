@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
-gpui-kit = "=0.9.0"
+gpui-kit = "=0.9.1"
 lumakit-ai = { path = "../LumaKit/crates/lumakit-ai" }
 lumakit-gpui = { path = "../LumaKit/crates/lumakit-gpui" }
 lumakit-usage-status = { path = "../LumaKit/crates/lumakit-usage-status" }
