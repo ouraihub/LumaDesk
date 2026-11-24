@@ -18,11 +18,13 @@ use lumakit_ai::{
     catalog::ModelEntry,
     model_config::{ModelType, PriceTier},
 };
+mod efforts;
 mod inputs;
 mod pricing;
 #[cfg(test)]
 mod tests;
 mod view;
+use efforts::{effort_dialect, offered_efforts, toggle_effort};
 
 #[derive(Default)]
 pub(crate) struct EditorState {

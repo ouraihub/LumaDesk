@@ -1,4 +1,5 @@
 use super::*;
+use lumakit_ai::model_config::{ReasoningDialect, ReasoningEffort};
 #[test]
 fn invalid_numeric_draft_preserves_saved_value() {
     let mut price = Some(2.0);
@@ -61,4 +62,81 @@ fn capability_choices_override_catalog_without_selecting_request_effort() {
     let declared = unknown.effective_settings(Protocol::OpenAiChat);
     assert!(declared.supports_reasoning());
     assert!(declared.reasoning.is_none()); // A capability declaration does not invent a wire protocol.
+}
+#[test]
+fn declared_efforts_reach_chat_for_uncatalogued_models() {
+    let mut model = ModelEntry {
+        id: "relay-only-model".into(),
+        capabilities: Default::default(),
+        manual: true,
+        settings: Default::default(),
+    };
+    set_capability(&mut model, Capability::Reasoning, true);
+    for effort in [ReasoningEffort::High, ReasoningEffort::None] {
+        toggle_effort(&mut model, Protocol::OpenAiChat, effort);
+    }
+    let saved = model.settings.reasoning.clone().unwrap();
+    assert_eq!(saved.dialect, ReasoningDialect::OpenAi);
+    assert_eq!(
+        saved.efforts,
+        [ReasoningEffort::None, ReasoningEffort::High]
+    );
+    let effective = model.effective_settings(Protocol::OpenAiChat);
+    assert!(effective.validate(Protocol::OpenAiChat).is_ok());
+    assert!(
+        effective
+            .effective_model()
+            .supports_effort(ReasoningEffort::High)
+    );
+    set_capability(&mut model, Capability::Reasoning, false);
+    assert!(
+        model
+            .effective_settings(Protocol::OpenAiChat)
+            .effective_model()
+            .supported_efforts()
+            .is_empty()
+    );
+    set_capability(&mut model, Capability::Reasoning, true);
+    toggle_effort(&mut model, Protocol::OpenAiChat, ReasoningEffort::High);
+    toggle_effort(&mut model, Protocol::OpenAiChat, ReasoningEffort::None);
+    assert!(model.settings.reasoning.is_none());
+    let mut anthropic = ModelEntry {
+        id: "relay-claude".into(),
+        ..model
+    };
+    toggle_effort(
+        &mut anthropic,
+        Protocol::AnthropicMessages,
+        ReasoningEffort::Max,
+    );
+    assert!(
+        anthropic
+            .effective_settings(Protocol::AnthropicMessages)
+            .validate(Protocol::AnthropicMessages)
+            .is_ok()
+    );
+    assert_eq!(
+        effort_dialect(&anthropic, Protocol::AnthropicMessages),
+        ReasoningDialect::AnthropicAdaptive
+    );
+    assert!(!offered_efforts(ReasoningDialect::OpenAi).any(|e| e == ReasoningEffort::Auto));
+}
+#[test]
+fn toggling_a_catalogued_model_keeps_its_prefilled_levels() {
+    let mut model = ModelEntry {
+        id: "gpt-6.1-terra".into(),
+        capabilities: Default::default(),
+        manual: false,
+        settings: Default::default(),
+    };
+    toggle_effort(&mut model, Protocol::OpenAiResponses, ReasoningEffort::Max);
+    assert_eq!(
+        model.settings.reasoning.unwrap().efforts,
+        [
+            ReasoningEffort::Low,
+            ReasoningEffort::Medium,
+            ReasoningEffort::High,
+            ReasoningEffort::Xhigh
+        ]
+    );
 }

@@ -88,6 +88,15 @@ impl ModelEditor {
                     )
                     .text_color(r.text_subtle),
                 );
+            if let Some(efforts) = self.effort_chips(cx) {
+                section = section.child(group_label("推理强度")).child(efforts).child(
+                    label(
+                        styles::METADATA,
+                        "勾选线路接受的档位，聊天时从中选择；未选档位时不发送推理参数。",
+                    )
+                    .text_color(r.text_subtle),
+                );
+            }
             if self.protocol != Protocol::OpenAiChat || self.value.settings.native_web_search {
                 section = section.child(
                     self.action(
@@ -154,7 +163,7 @@ impl ModelEditor {
             .child(
                 label(
                     styles::METADATA,
-                    "点击修改能力声明，保存后生效；推理强度在聊天时调整。音频／视频上传尚未接入。",
+                    "点击修改能力声明，保存后生效。音频／视频上传尚未接入。",
                 )
                 .text_color(r.text_subtle),
             )
@@ -178,6 +187,33 @@ impl ModelEditor {
         .selected(supported)
         .accessibility_label("推理能力")
         .tooltip("声明模型是否支持推理；不设置当前请求的强度")
+    }
+    /// Declared-effort toggles, shown while the model declares reasoning (ThinkRail's editor).
+    fn effort_chips(&self, cx: &Context<Self>) -> Option<gpui_kit::Div> {
+        let effective = self.value.effective_settings(self.protocol);
+        if !effective.supports_reasoning() {
+            return None;
+        }
+        let declared = effective.effective_model().supported_efforts();
+        let mut row = div().flex().flex_wrap().gap(space::S6);
+        for effort in offered_efforts(effort_dialect(&self.value, self.protocol)) {
+            let on = declared.contains(&effort);
+            let name = lumakit_gpui::chat::effort_label(effort);
+            let protocol = self.protocol;
+            row = row.child(
+                self.action(
+                    format!("effort-{effort:?}"),
+                    name,
+                    on,
+                    cx,
+                    move |this, _, _| toggle_effort(&mut this.value, protocol, effort),
+                )
+                .toggled(on)
+                .selected(on)
+                .accessibility_label(format!("推理强度：{name}")),
+            );
+        }
+        Some(row)
     }
     fn type_chip(&self, index: usize, kind: ModelType, cx: &Context<Self>) -> Button {
         let selected = self.value.settings.model_type == kind;

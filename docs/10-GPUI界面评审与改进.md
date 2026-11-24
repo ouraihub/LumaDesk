@@ -222,3 +222,10 @@ Cherry `ModelSpeedControl.tsx` 从模型能力派生可用档位，选择持久�
 
 - ThinkRail 直接传输 host 的 `thinkingLevels`，不是前端自行列出所有档位；`toWireModel` 调用 `getSupportedThinkingLevels`，官方 Pi 规则按 `thinkingLevelMap` 过滤。截图对应的实际有效列表是 `off / minimal / low / medium / high`，显示为“关闭 / 最低 / 低 / 中 / 高”。
 - 本地 GPT-6.1 Sol 的 OMP 公开目录仍保留 xhigh/max 参考档位，但当前 ThinkRail 对标线路按上述五档展示；请求参数映射保持 off/minimal/low/medium/high 原值，默认仍不发送显式档位。UI 测试必须核对可访问标签和实际列表，不只看滑杆视觉。
+
+## 15. 模型页恢复推理档位勾选（2026-11-24）
+
+- 问题：`gpt-6.2-sol` 等未收录于内置 OMP 快照的中转模型，即使声明“推理”也没有档位，聊天选择器隐藏强度栏。根因是第 12 节之后档位只来自 `model_reference.json`。
+- 按用户决定改为 ThinkRail Native 做法（`providers/models/editor.rs` 的 efforts 按钮组）：模型声明推理后，编辑页“模型能力”下显示“推理强度”档位勾选（关闭/最低/低/中/高/极高/最高；auto 仅限能编码它的 ThinkingType/Qwen 方言），保存到 `settings.reasoning.efforts`。本节取代第 12 节“模型页不再编辑推理档位”的规则；方言、预算仍不在界面编辑。
+- 方言不让用户选：已有保存值优先，其次目录值，否则按线路协议取 `ReasoningDialect::for_protocol`（OpenAI Chat/Responses → OpenAi，Anthropic → AnthropicAdaptive）。目录已收录的模型首次勾选时以目录档位为起点；全部取消则回到目录声明。修改线路协议时，不兼容的方言改为新协议方言，去掉无法编码的 auto/预算。
+- 聊天“默认”语义不变：未在聊天中选档位时仍不发送推理参数。

@@ -239,7 +239,12 @@ impl ModelSettings {
                         .ok_or("线路已不存在")?;
                     endpoint.name = name.trim().into();
                     endpoint.base_url = url;
-                    endpoint.protocol = *protocol;
+                    if endpoint.protocol != *protocol {
+                        endpoint.protocol = *protocol;
+                        for model in &mut endpoint.models {
+                            reencode_reasoning(&mut model.settings, *protocol);
+                        }
+                    }
                 } else {
                     let id = new_id()?;
                     p.endpoints.push(EndpointEntry {
@@ -310,5 +315,55 @@ impl ModelSettings {
             EditorDialog::Keys { .. } => {}
         }
         Ok(())
+    }
+}
+/// Keeps the user's declared efforts across a protocol switch by moving them to the new
+/// protocol's own dialect; levels or budgets that dialect cannot encode are dropped.
+fn reencode_reasoning(settings: &mut lumakit_ai::model_config::ModelSettings, protocol: Protocol) {
+    use lumakit_ai::model_config::{ReasoningDialect, ReasoningEffort};
+    let Some(config) = &mut settings.reasoning else {
+        return;
+    };
+    if config.dialect.fits(protocol) {
+        return;
+    }
+    config.dialect = ReasoningDialect::for_protocol(protocol);
+    config.budget_tokens = None;
+    config
+        .efforts
+        .retain(|effort| *effort != ReasoningEffort::Auto);
+    if config.efforts.is_empty() {
+        settings.reasoning = None;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lumakit_ai::model_config::{
+        ModelSettings, ReasoningConfig, ReasoningDialect, ReasoningEffort,
+    };
+    #[test]
+    fn protocol_switch_keeps_declared_efforts_saveable() {
+        let mut settings = ModelSettings {
+            reasoning: Some(ReasoningConfig {
+                dialect: ReasoningDialect::OpenAi,
+                efforts: vec![ReasoningEffort::Low, ReasoningEffort::High],
+                budget_tokens: None,
+            }),
+            ..Default::default()
+        };
+        reencode_reasoning(&mut settings, Protocol::OpenAiResponses);
+        assert_eq!(
+            settings.reasoning.as_ref().unwrap().dialect,
+            ReasoningDialect::OpenAi
+        );
+        reencode_reasoning(&mut settings, Protocol::AnthropicMessages);
+        let config = settings.reasoning.as_ref().unwrap();
+        assert_eq!(config.dialect, ReasoningDialect::AnthropicAdaptive);
+        assert_eq!(
+            config.efforts,
+            [ReasoningEffort::Low, ReasoningEffort::High]
+        );
+        assert!(settings.validate(Protocol::AnthropicMessages).is_ok());
     }
 }
