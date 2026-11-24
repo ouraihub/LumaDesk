@@ -131,7 +131,11 @@ impl LogSettings {
             .gap(space::S4)
             .min_w_0()
             .child(
-                label(text::CODE_SMALL, format!("{} {}", line.time, line.level)).text_color(color),
+                label(
+                    text::CODE_SMALL,
+                    format!("{} {}", local_time(&line.time), line.level),
+                )
+                .text_color(color),
             );
         if let Some(trace) = trace {
             let selected = self.query.read(cx).value().trim() == trace;

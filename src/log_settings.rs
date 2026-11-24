@@ -157,6 +157,19 @@ fn keeps(line: &LogLine, event: Option<&str>, layer: Option<&str>, query: &str) 
         && (query.is_empty() || line.raw.to_lowercase().contains(query))
 }
 
+/// Log files keep UTC (`…Z`) so traces line up across machines; the viewer shows the computer's
+/// local time. Unparseable stamps are shown as written rather than guessed.
+fn local_time(utc: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(utc).map_or_else(
+        |_| utc.to_owned(),
+        |time| {
+            time.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

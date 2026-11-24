@@ -35,6 +35,7 @@ impl DesktopApp {
         let models = model_settings::ModelSettings::create(&root, window, cx)?;
         let search = search_settings::SearchSettings::create(&root, window, cx)?;
         let mcp = mcp_settings::McpSettings::create(&root, window, cx)?;
+        let closing_logs = logs.clone();
         let logs = log_settings::LogSettings::create(logs, window, cx);
         let mut chat = chat::ChatState::new(&root)?;
         tracing::info!(
@@ -113,6 +114,8 @@ impl DesktopApp {
                 if this.chat.can_close() {
                     this.leave_settings(window, cx);
                     tracing::info!("app.closed");
+                    // GPUI's Windows backend keeps calling Win32 on the destroyed window after this.
+                    closing_logs.mark_closing();
                     true
                 } else {
                     this.launch(0, window, cx);
