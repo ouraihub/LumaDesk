@@ -81,37 +81,29 @@ impl Render for DesktopApp {
                         ),
                 )
                 .child(div().flex_1())
-                .child(
-                    div()
-                        .id("title-actions")
-                        .occlude()
-                        .flex()
-                        .items_center()
-                        .gap(space::S4)
-                        .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
-                            this.clear_navigation_secrets(window, cx);
-                        }))
-                        .child(
-                            Button::new("appearance")
-                                .icon(IconName::Palette)
-                                .label("外观")
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_settings(SettingsPage::Appearance, window, cx)
-                                })),
-                        )
-                        .child(
-                            Button::new("settings")
-                                .icon(IconName::Settings)
-                                .label("设置")
-                                .small()
-                                .ghost()
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.open_settings(SettingsPage::Models, window, cx)
-                                })),
-                        ),
-                ),
+                // The rail's settings item is the only entry; narrow windows hide the rail, so the
+                // title bar carries it there instead.
+                .when(narrow, |bar| {
+                    bar.child(
+                        div()
+                            .id("title-actions")
+                            .occlude()
+                            .capture_any_mouse_down(cx.listener(|this, _, window, cx| {
+                                this.clear_navigation_secrets(window, cx);
+                            }))
+                            .child(
+                                Button::new("settings")
+                                    .icon(IconName::Settings)
+                                    .accessibility_label("设置")
+                                    .tooltip("设置")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_settings(SettingsPage::Models, window, cx)
+                                    })),
+                            ),
+                    )
+                }),
         );
         let content = if let Some(page) = self.settings {
             let query = self.settings_query.read(cx).value().trim().to_lowercase();
