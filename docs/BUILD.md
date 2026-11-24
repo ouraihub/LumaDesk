@@ -2,7 +2,7 @@
 
 工具链由 `rust-toolchain.toml` 固定为 Rust 1.99.0（含 `rustfmt`、`clippy`），edition 2024，依赖锁定在 `Cargo.lock`。LumaDesk 通过路径依赖使用相邻的 `../LumaKit`（`lumakit-ai`、`lumakit-design`、`lumakit-gpui`、`lumakit-support`、`lumakit-observability`），两个仓库须并排检出。
 
-`main` 分支的界面基于 crates.io `gpui-kit = "=0.9.0"`（默认后端 gpui-pre 0.3.11，不启用 gpui-fast），LumaKit 的 `lumakit-design`、`lumakit-gpui` 锁定同一版本。
+`main` 分支的界面基于 crates.io `gpui-kit = "=0.11.0"`（默认后端 gpui-pre 0.3.14，不启用 gpui-fast；锁文件含 gpui-fast 条目但不编译），LumaKit 的 `lumakit-design`、`lumakit-gpui`、`lumakit-model-picker`、`lumakit-usage-status` 锁定同一版本。ThinkRail Native 消费 LumaKit 时须同时升级到同一 gpui-kit 版本。
 
 设计系统是 LumaKit 的 `lumakit-design`（提炼自 ThinkRail Native `crates/ui`）：主题目录（含暖纸 `warm-light`/`warm-dark`）、颜色角色与 Kit 映射、尺寸/字体令牌、内置字体（Geist、JetBrains Mono、Orbitron，OFL 许可在 `assets/fonts`）、图标源 `UiAssets`、设置页组件 `components::settings`，以及外观偏好与外观页 `appearance`（`src/theme.rs` 只负责存进 `settings.db` 和迁移 schema 1）。视图只用 `LumaTheme::global(cx).roles` 和 `metrics::*`，不写十六进制颜色。
 
