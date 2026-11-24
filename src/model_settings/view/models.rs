@@ -247,7 +247,8 @@ impl ModelSettings {
         }
         rows
     }
-    /// A model: name, capability tags and id · type (click selects it); settings and remove on the right.
+    /// A model on one line (ThinkRail `render_model`): name, the id only when a display name hides
+    /// it, the type unless chat, and capability tags; settings and remove on the right.
     pub(super) fn model_row(
         &self,
         p: usize,
@@ -259,6 +260,8 @@ impl ModelSettings {
         let endpoint = &self.draft.providers[p].endpoints[e];
         let selected = endpoint.selected_model.as_ref() == Some(&model.id);
         let name = model.settings.display_name(&model.id).to_owned();
+        let renamed = name != model.id;
+        let kind = model.settings.model_type;
         let id = model.id.clone();
         let effective = model.effective_settings(endpoint.protocol);
         let select = self.on(
@@ -276,24 +279,14 @@ impl ModelSettings {
                         .min_w(px(0.))
                         .flex_1()
                         .child(ui::avatar(&name, &r))
-                        .child(
-                            v_flex()
-                                .min_w(px(0.))
-                                .flex_1()
-                                .child(label(text::UI, name).min_w(px(0.)).truncate())
-                                .child(
-                                    hint(
-                                        format!(
-                                            "{} · {}",
-                                            model.id,
-                                            model.settings.model_type.label()
-                                        ),
-                                        &r,
-                                    )
-                                    .min_w(px(0.))
-                                    .truncate(),
-                                ),
-                        )
+                        .child(label(text::UI, name).min_w(px(0.)).truncate())
+                        .when(renamed, |row| {
+                            row.child(hint(model.id.clone(), &r).min_w(px(0.)).truncate())
+                        })
+                        .child(div().flex_1())
+                        .when(kind != ModelType::Chat, |row| {
+                            row.child(hint(kind.label(), &r).flex_shrink_0())
+                        })
                         .child(lumakit_gpui::model_capability_badges(&effective, r)),
                 ),
             cx,
